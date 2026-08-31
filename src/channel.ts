@@ -38,7 +38,19 @@ export type ChannelSnapshot = {
   generatingNow: ChannelIdea[]
   queue: ChannelIdea[]
   chat: ChannelIdea[]
+  chatPage?: {
+    hasMore: boolean
+    oldestId: number | null
+  }
   serverTime: number
+}
+
+export type ChatHistoryPage = {
+  items: ChannelIdea[]
+  page: {
+    hasMore: boolean
+    nextBefore: number | null
+  }
 }
 
 export type ConnectionStatus = 'connecting' | 'live' | 'reconnecting'
@@ -107,6 +119,17 @@ export function likeChannel() {
   return postJson<{ likes: number; revision: number }>('/api/likes', {})
 }
 
+export async function loadOlderChat(before: number, limit = 100, signal?: AbortSignal) {
+  const query = new URLSearchParams({ before: String(before), limit: String(limit) })
+  const response = await fetch(`/api/chat?${query.toString()}`, {
+    headers: { Accept: 'application/json' },
+    credentials: 'same-origin',
+    cache: 'no-store',
+    signal,
+  })
+  return readResponse<ChatHistoryPage>(response)
+}
+
 export function useChannel() {
   const [snapshot, setSnapshot] = useState<ChannelSnapshot | null>(null)
   const [connection, setConnection] = useState<ConnectionStatus>('connecting')
@@ -118,6 +141,7 @@ export function useChannel() {
     latestRevision.current = next.revision
     setSnapshot(next)
     setError(null)
+    setConnection('live')
   }, [])
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
@@ -132,26 +156,25 @@ export function useChannel() {
 
   useEffect(() => {
     const controller = new AbortController()
-    void refresh(controller.signal)
-
-    const events = new EventSource('/api/events')
-    events.onopen = () => setConnection('live')
-    events.addEventListener('state', (event) => {
-      try {
-        applySnapshot(JSON.parse((event as MessageEvent<string>).data) as ChannelSnapshot)
-      } catch {
-        setError('Received an invalid channel update')
-      }
-    })
-    events.onerror = () => setConnection('reconnecting')
-
-    const poll = window.setInterval(() => void refresh(controller.signal), 2_500)
-    return () => {
-      controller.abort()
-      events.close()
-      window.clearInterval(poll)
+    let timer: number | null = null
+    let stopped = false
+    const poll = async () => {
+      await refresh(controller.signal)
+      if (stopped) return
+      timer = window.setTimeout(poll, document.hidden ? 15_000 : 4_000)
     }
-  }, [applySnapshot, refresh])
+    const refreshForVisibility = () => {
+      if (!document.hidden) void refresh(controller.signal)
+    }
+    document.addEventListener('visibilitychange', refreshForVisibility)
+    void poll()
+    return () => {
+      stopped = true
+      controller.abort()
+      if (timer !== null) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', refreshForVisibility)
+    }
+  }, [refresh])
 
   return { snapshot, connection, error, refresh }
 }

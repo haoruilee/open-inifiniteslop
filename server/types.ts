@@ -70,6 +70,10 @@ export type ChannelSnapshot = {
   generatingNow: PublicIdea[]
   queue: PublicIdea[]
   chat: PublicIdea[]
+  chatPage: {
+    hasMore: boolean
+    oldestId: number | null
+  }
   serverTime: number
 }
 

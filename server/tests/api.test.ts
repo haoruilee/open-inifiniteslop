@@ -251,6 +251,35 @@ test('serves original-compatible status and chat read contracts', async () => {
   }
 })
 
+test('pages a large chat history while keeping live state payloads bounded', async () => {
+  const server = await startTestServer()
+  try {
+    for (let index = 0; index < 125; index += 1) {
+      server.database.createSubmission(
+        `history-${index}`,
+        'history',
+        `safe channel history item ${index}`,
+        { decision: 'approve', reason: null },
+      )
+    }
+    const state = await (await server.request('/api/state')).json() as ChannelSnapshot
+    assert.equal(state.chat.length, 60)
+    assert.equal(state.chatPage.hasMore, true)
+    assert.equal(state.chatPage.oldestId, state.chat[0].id)
+
+    const older = await (await server.request(`/api/chat?before=${state.chatPage.oldestId}&limit=25`)).json() as {
+      items: Array<{ id: number }>
+      page: { hasMore: boolean; nextBefore: number | null }
+    }
+    assert.equal(older.items.length, 25)
+    assert.equal(older.items.every((item) => item.id < state.chatPage.oldestId!), true)
+    assert.equal(older.items[0].id, older.page.nextBefore)
+    assert.equal(older.page.hasMore, true)
+  } finally {
+    await server.close()
+  }
+})
+
 test('streams an initial SSE snapshot and the next mutation revision', async () => {
   const server = await startTestServer()
   const controller = new AbortController()

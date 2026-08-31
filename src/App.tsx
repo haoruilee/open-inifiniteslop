@@ -3,6 +3,7 @@ import {
   ChannelApiError,
   type ChannelIdea,
   likeChannel,
+  loadOlderChat,
   submitPrompt,
   useChannel,
   voteForIdea,
@@ -175,6 +176,9 @@ function ChatPanel({
   onVote,
   votedIds,
   pendingVotes,
+  hasOlderChat,
+  loadingOlderChat,
+  onLoadOlderChat,
 }: {
   chat: FeedItem[]
   activeTab: 'chat' | 'queue'
@@ -190,16 +194,41 @@ function ChatPanel({
   onVote: (id: number) => void
   votedIds: Set<number>
   pendingVotes: Set<number>
+  hasOlderChat: boolean
+  loadingOlderChat: boolean
+  onLoadOlderChat: () => Promise<void>
 }) {
   const messagesRef = useRef<HTMLDivElement>(null)
+  const latestChatId = chat[chat.length - 1]?.id ?? null
+  const lastChatId = useRef<number | null>(null)
+  const wasAtBottom = useRef(true)
 
   useEffect(() => {
+    const previous = lastChatId.current
+    lastChatId.current = latestChatId
+    if (previous !== null && previous === latestChatId) return
     const frame = window.requestAnimationFrame(() => {
       const messages = messagesRef.current
-      if (messages) messages.scrollTop = messages.scrollHeight
+      if (messages && (previous === null || wasAtBottom.current)) messages.scrollTop = messages.scrollHeight
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [chat.length])
+  }, [latestChatId])
+
+  async function loadEarlierMessages() {
+    const messages = messagesRef.current
+    const previousHeight = messages?.scrollHeight ?? 0
+    await onLoadOlderChat()
+    window.requestAnimationFrame(() => {
+      const updated = messagesRef.current
+      if (updated) updated.scrollTop += updated.scrollHeight - previousHeight
+    })
+  }
+
+  function trackScroll() {
+    const messages = messagesRef.current
+    if (!messages) return
+    wasAtBottom.current = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48
+  }
 
   return (
     <aside className="chat-panel" data-testid="chat-panel">
@@ -212,7 +241,12 @@ function ChatPanel({
 
       {activeTab === 'chat' || isDesktop ? (
         <div className="chat-tab-pane">
-          <div className="chat-messages" data-testid="chat-messages" ref={messagesRef}>
+          <div className="chat-messages" data-testid="chat-messages" ref={messagesRef} onScroll={trackScroll}>
+            {hasOlderChat ? (
+              <button className="load-earlier" type="button" onClick={() => void loadEarlierMessages()} disabled={loadingOlderChat}>
+                {loadingOlderChat ? 'loading…' : 'earlier messages'}
+              </button>
+            ) : null}
             {chat.length > 0
               ? chat.map((item) => <FeedBubble key={item.id} item={item} className="chat-bubble" />)
               : <div className="empty-feed chat-empty">be the first to decide what airs</div>}
@@ -308,10 +342,22 @@ function App() {
   const [heartKeys, setHeartKeys] = useState<number[]>([])
   const [notice, setNotice] = useState<string | null>(null)
   const [failedVideoId, setFailedVideoId] = useState<number | null>(null)
+  const [olderChat, setOlderChat] = useState<ChannelIdea[]>([])
+  const [olderChatCursor, setOlderChatCursor] = useState<number | null>(null)
+  const [hasOlderChat, setHasOlderChat] = useState(false)
+  const [loadingOlderChat, setLoadingOlderChat] = useState(false)
   const noticeTimer = useRef<number | null>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const chatHistoryExhausted = useRef(false)
 
-  const chat = useMemo(() => (snapshot?.chat ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.chat, nickname])
+  const chatIdeas = useMemo(() => {
+    const latest = snapshot?.chat ?? []
+    const byId = new Map<number, ChannelIdea>()
+    for (const idea of [...olderChat, ...latest]) byId.set(idea.id, idea)
+    const ordered = [...byId.values()].sort((left, right) => left.id - right.id)
+    return ordered.length > 600 ? ordered.slice(-600) : ordered
+  }, [olderChat, snapshot?.chat])
+  const chat = useMemo(() => chatIdeas.map((idea) => toFeedItem(idea, nickname)), [chatIdeas, nickname])
   const playingNext = useMemo(() => (snapshot?.playingNext ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.playingNext, nickname])
   const generatingNow = useMemo(() => (snapshot?.generatingNow ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.generatingNow, nickname])
   const queue = useMemo(() => (snapshot?.queue ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.queue, nickname])
@@ -321,8 +367,22 @@ function App() {
   ))
 
   useEffect(() => {
+    const first = snapshot?.chat[0]?.id ?? null
+    if (first === null) return
+    if (chatHistoryExhausted.current) return
+    setOlderChatCursor((current) => current === null ? (snapshot?.chatPage?.oldestId ?? first) : current)
+    setHasOlderChat((current) => current || Boolean(snapshot?.chatPage?.hasMore))
+  }, [snapshot?.chat, snapshot?.chatPage?.hasMore, snapshot?.chatPage?.oldestId])
+
+  useEffect(() => {
     setFailedVideoId(null)
   }, [nowPlaying?.id, nowPlaying?.videoUrl, nowPlaying?.startedAt])
+
+  useEffect(() => {
+    if (failedVideoId === null) return
+    const timer = window.setTimeout(() => setFailedVideoId(null), 3_000)
+    return () => window.clearTimeout(timer)
+  }, [failedVideoId])
 
   useEffect(() => () => {
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current)
@@ -396,6 +456,27 @@ function App() {
         next.delete(id)
         return next
       })
+    }
+  }
+
+  async function handleLoadOlderChat() {
+    if (loadingOlderChat || !hasOlderChat || olderChatCursor === null) return
+    setLoadingOlderChat(true)
+    try {
+      const page = await loadOlderChat(olderChatCursor)
+      setOlderChat((existing) => {
+        const byId = new Map<number, ChannelIdea>()
+        for (const idea of [...page.items, ...existing]) byId.set(idea.id, idea)
+        return [...byId.values()].sort((left, right) => left.id - right.id).slice(-540)
+      })
+      setOlderChatCursor(page.page.nextBefore)
+      if (!page.page.hasMore) chatHistoryExhausted.current = true
+      setHasOlderChat(page.page.hasMore)
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+    } catch (requestError) {
+      showNotice(noticeForError(requestError))
+    } finally {
+      setLoadingOlderChat(false)
     }
   }
 
@@ -507,6 +588,9 @@ function App() {
           onVote={(id) => void handleVote(id)}
           votedIds={votedIds}
           pendingVotes={pendingVotes}
+          hasOlderChat={hasOlderChat}
+          loadingOlderChat={loadingOlderChat}
+          onLoadOlderChat={handleLoadOlderChat}
         />
       ) : null}
 

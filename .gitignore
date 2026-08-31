@@ -8,6 +8,7 @@ data
 .credentials/
 credentials/
 .secrets/
+.wrangler/
 .DS_Store
 *.log
 *.tsbuildinfo

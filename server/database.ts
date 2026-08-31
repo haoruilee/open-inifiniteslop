@@ -652,11 +652,32 @@ export class ChannelDatabase {
     return rows.map(mapIdea)
   }
 
+  listChatPage(before: number | null, limit: number) {
+    const safeLimit = Math.min(200, Math.max(10, Math.trunc(limit)))
+    const rows = this.db.prepare(`${publicStatusSql}
+      INNER JOIN chat_messages c ON c.idea_id = i.id
+      WHERE i.status NOT IN ('pending_review', 'rejected')
+        AND (? IS NULL OR i.id < ?)
+      GROUP BY i.id
+      ORDER BY i.id DESC
+      LIMIT ?
+    `).all(before, before, safeLimit + 1) as IdeaRow[]
+    const hasMore = rows.length > safeLimit
+    const items = rows.slice(0, safeLimit).reverse().map(mapIdea).map(toPublicIdea)
+    return {
+      items,
+      page: {
+        hasMore,
+        nextBefore: items.length > 0 ? items[0].id : null,
+      },
+    }
+  }
+
   snapshot(providerOverride?: string): ChannelSnapshot {
     const channel = this.db.prepare('SELECT * FROM channel_state WHERE singleton = 1').get() as ChannelRow
     const nowPlaying = this.listByStatus('playing', 1, 'i.status_changed_at ASC, i.id ASC')[0] ?? null
-    const freshNext = this.listByStatus('ready', 20, 'i.status_changed_at ASC, i.id ASC')
-    const replaySlots = Math.max(0, 4 - freshNext.length)
+    const freshNext = this.listByStatus('ready', 8, 'i.status_changed_at ASC, i.id ASC')
+    const replaySlots = Math.max(0, 8 - freshNext.length)
     const replayNext = replaySlots > 0
       ? (this.db.prepare(`${publicStatusSql}
           WHERE i.status = 'aired' AND (i.video_url IS NOT NULL OR i.video_path IS NOT NULL)
@@ -668,13 +689,7 @@ export class ChannelDatabase {
     const playingNext = [...freshNext, ...replayNext]
     const generatingNow = this.listByStatus('generating', 20, 'i.status_changed_at ASC, i.id ASC')
     const queue = this.listByStatus('queued', 50, 'votes DESC, i.created_at ASC, i.id ASC')
-    const chatRows = this.db.prepare(`${publicStatusSql}
-      INNER JOIN chat_messages c ON c.idea_id = i.id
-      WHERE i.status NOT IN ('pending_review', 'rejected')
-      GROUP BY i.id
-      ORDER BY c.created_at DESC, c.id DESC
-      LIMIT 100
-    `).all() as IdeaRow[]
+    const chat = this.listChatPage(null, 60)
 
     return {
       revision: Number(channel.revision),
@@ -688,7 +703,11 @@ export class ChannelDatabase {
       playingNext: playingNext.map(toPublicIdea),
       generatingNow: generatingNow.map(toPublicIdea),
       queue: queue.map(toPublicIdea),
-      chat: chatRows.reverse().map(mapIdea).map(toPublicIdea),
+      chat: chat.items,
+      chatPage: {
+        hasMore: chat.page.hasMore,
+        oldestId: chat.items.length > 0 ? chat.items[0].id : null,
+      },
       serverTime: this.now(),
     }
   }

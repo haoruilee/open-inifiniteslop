@@ -9,13 +9,18 @@
     "dev:server": "tsx watch server/index.ts",
     "build:client": "tsc --noEmit && vite build",
     "build:server": "tsc -p tsconfig.server.json",
-    "build": "pnpm build:client && pnpm build:server",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    "build": "pnpm build:client && pnpm build:server && pnpm build:worker",
     "test": "NODE_ENV=test tsx --test server/tests/*.test.ts",
     "start": "node server-dist/index.js",
     "smoke": "node scripts/smoke.mjs",
     "check:secrets": "node scripts/check-secrets.mjs",
-    "check": "pnpm test && pnpm build && pnpm smoke && pnpm check:secrets",
-    "preview": "vite preview --host 127.0.0.1"
+    "check:worker": "wrangler deploy --dry-run",
+    "check": "pnpm test && pnpm build && pnpm smoke && pnpm check:worker && pnpm check:secrets",
+    "preview": "vite preview --host 127.0.0.1",
+    "cf:types": "wrangler types worker/worker-configuration.d.ts --include-runtime false",
+    "cf:dev": "pnpm build:client && wrangler dev",
+    "cf:deploy": "pnpm build && wrangler deploy"
   },
   "dependencies": {
     "@fal-ai/client": "^1.10.1",
@@ -24,6 +29,7 @@
     "zod": "^4.5.4"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260831.1",
     "@types/node": "^26.4.0",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
@@ -31,6 +37,7 @@
     "concurrently": "^10.0.5",
     "tsx": "^4.23.13",
     "typescript": "^5.9.2",
-    "vite": "^7.1.3"
+    "vite": "^7.1.3",
+    "wrangler": "^4.127.1"
   }
 }

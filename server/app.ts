@@ -384,6 +384,17 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
       }
 
       if (method === 'GET' && pathname === '/api/chat') {
+        if (url.searchParams.has('before') || url.searchParams.has('limit')) {
+          const rawBefore = url.searchParams.get('before')
+          const before = rawBefore && /^\d+$/u.test(rawBefore) ? Number(rawBefore) : null
+          if (rawBefore && (!before || !Number.isSafeInteger(before))) {
+            throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid chat cursor')
+          }
+          const rawLimit = Number.parseInt(url.searchParams.get('limit') || '100', 10)
+          const limit = Number.isSafeInteger(rawLimit) ? rawLimit : 100
+          json(response, 200, database.listChatPage(before, limit), 'private, max-age=0')
+          return
+        }
         const state = snapshot()
         const since = Math.max(0, Number.parseInt(url.searchParams.get('since') || '0', 10) || 0)
         const messages = state.chat.filter((idea) => idea.id > since).slice(-50)

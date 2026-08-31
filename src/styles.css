@@ -356,6 +356,11 @@ a:focus-visible,
   word-break: break-word;
 }
 
+.chat-bubble {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 54px;
+}
+
 .feed-bubble .time {
   margin-right: 6px;
   opacity: .5;
@@ -521,8 +526,24 @@ a:focus-visible,
   margin-top: auto;
 }
 
-.chat-bubble {
-  font-size: 16px;
+.chat-bubble { font-size: 16px; }
+
+.load-earlier {
+  align-self: center;
+  margin: 2px 0 5px;
+  padding: 5px 10px;
+  border: 2px solid #000;
+  border-radius: 999px;
+  color: #111;
+  cursor: pointer;
+  background: rgba(255, 255, 255, .92);
+  box-shadow: 2px 2px 0 #000;
+  font: 700 11px Tahoma, sans-serif;
+}
+
+.load-earlier:disabled {
+  cursor: wait;
+  opacity: .65;
 }
 
 .chat-form {

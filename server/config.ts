@@ -82,7 +82,7 @@ export function loadConfig(
     orangePollIntervalMs: integerValue(environment.ORANGE_POLL_INTERVAL_MS, 2_000, 250, 60_000),
     generationConcurrency: integerValue(environment.GENERATION_CONCURRENCY, 1, 1, 4),
     generationMaximumAttempts: integerValue(environment.GENERATION_MAX_ATTEMPTS, 3, 1, 10),
-    bufferTarget: integerValue(environment.BUFFER_TARGET, 4, 1, 20),
+    bufferTarget: integerValue(environment.BUFFER_TARGET, 8, 1, 20),
     workerIntervalMs: integerValue(environment.WORKER_INTERVAL_MS, 750, 100, 60_000),
     rotationIntervalMs: integerValue(environment.ROTATION_INTERVAL_MS, 500, 100, 10_000),
     mockGenerationDelayMs: integerValue(environment.MOCK_GENERATION_DELAY_MS, 800, 0, 60_000),
