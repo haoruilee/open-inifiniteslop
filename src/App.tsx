@@ -512,6 +512,23 @@ function App() {
   const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
   const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
 
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !showVideo) return
+
+    const startPlayback = () => {
+      video.muted = !tunedIn
+      void video.play().catch(() => undefined)
+    }
+
+    video.addEventListener('canplay', startPlayback)
+    const timer = window.setTimeout(startPlayback, 0)
+    return () => {
+      video.removeEventListener('canplay', startPlayback)
+      window.clearTimeout(timer)
+    }
+  }, [nowPlaying?.id, nowPlaying?.videoUrl, showVideo, tunedIn])
+
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
       <div className={`tv-wrap ${tunedIn ? 'playing' : ''}`}>
@@ -526,10 +543,12 @@ function App() {
             autoPlay
             muted={!tunedIn}
             playsInline
-            loop
             preload="auto"
-            onError={() => setFailedVideoId(nowPlaying?.id ?? null)}
-            onEnded={() => window.setTimeout(() => void refresh(), 250)}
+            onError={() => {
+              setFailedVideoId(nowPlaying?.id ?? null)
+              void refresh()
+            }}
+            onEnded={() => void refresh()}
           />
         ) : null}
         {preloadedVideo?.videoUrl ? (
