@@ -50,7 +50,8 @@ a {
 
 button:focus-visible,
 input:focus-visible,
-a:focus-visible {
+a:focus-visible,
+.splash:focus-visible {
   outline: 3px solid #56c7ff;
   outline-offset: 2px;
 }

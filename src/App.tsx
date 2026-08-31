@@ -1,4 +1,4 @@
-import { FormEvent, memo, useEffect, useMemo, useState } from 'react'
+import { FormEvent, memo, useEffect, useMemo, useRef, useState } from 'react'
 
 type FeedItem = {
   id: number
@@ -151,6 +151,16 @@ function ChatPanel({
   queue: FeedItem[]
   onVote: (id: number) => void
 }) {
+  const messagesRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const messages = messagesRef.current
+      if (messages) messages.scrollTop = messages.scrollHeight
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [chat.length])
+
   return (
     <aside className="chat-panel" data-testid="chat-panel">
       {!isDesktop ? (
@@ -162,7 +172,7 @@ function ChatPanel({
 
       {activeTab === 'chat' || isDesktop ? (
         <div className="chat-tab-pane">
-          <div className="chat-messages" data-testid="chat-messages">
+          <div className="chat-messages" data-testid="chat-messages" ref={messagesRef}>
             {chat.map((item) => <FeedBubble key={item.id} item={item} className="chat-bubble" />)}
           </div>
           <form className="chat-form" onSubmit={onSubmit}>
@@ -194,7 +204,20 @@ function PlayIcon() {
 
 function Splash({ onTuneIn }: { onTuneIn: () => void }) {
   return (
-    <button className="splash" onClick={onTuneIn} aria-label="Tune in to Infinite Slop">
+    <div
+      className="splash"
+      role="button"
+      tabIndex={0}
+      onClick={onTuneIn}
+      onKeyDown={(event) => {
+        if ((event.target as HTMLElement).closest('a')) return
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onTuneIn()
+        }
+      }}
+      aria-label="Tune in to Infinite Slop"
+    >
       <span className="splash-inner">
         <span className="logo">Infinite Slop</span>
         <PlayIcon />
@@ -204,7 +227,7 @@ function Splash({ onTuneIn }: { onTuneIn: () => void }) {
         </span>
         <BrandCredit compact />
       </span>
-    </button>
+    </div>
   )
 }
 
