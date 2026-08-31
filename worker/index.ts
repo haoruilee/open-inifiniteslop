@@ -5,6 +5,7 @@ import {
 } from 'cloudflare:workers'
 import { NonRetryableError } from 'cloudflare:workflows'
 import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
+import { mp4DurationSeconds } from './mp4-duration.js'
 
 type GenerationParams = {
   ideaId: number
@@ -1139,7 +1140,7 @@ export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Gener
       }
       if (!resultUrl) throw new NonRetryableError('orange_generation_timeout')
 
-      const videoKey = await step.do('persist generated video in KV', async () => {
+      const storedVideo = await step.do('persist generated video in KV', async () => {
         const response = await fetch(resultUrl, {
           headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InfiniteAISlop/1.0)' },
         })
@@ -1171,7 +1172,7 @@ export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Gener
         await this.env.VIDEO_MEDIA.put(key, bytes, {
           metadata: { contentType: response.headers.get('Content-Type') || 'video/mp4' },
         })
-        return key
+        return { key, durationSeconds: mp4DurationSeconds(new Uint8Array(bytes)) }
       })
 
       await step.do('publish generated video', async () => {
@@ -1187,7 +1188,7 @@ export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Gener
               poster_url = '/assets/tv-frame.png', duration_seconds = ?,
               generation_progress = 'complete', error = NULL
           WHERE id = ? AND status = 'generating'
-        `).bind(now, videoKey, durationForIdea(this.env, idea), ideaId).run()
+        `).bind(now, storedVideo.key, storedVideo.durationSeconds ?? durationForIdea(this.env, idea), ideaId).run()
         if (Number(updated.meta.changes ?? 0) === 0) throw new NonRetryableError('idea_publish_state_changed')
         await bumpRevision(this.env, now)
       })
