@@ -9,11 +9,20 @@ export type RuntimeConfig = {
   adminToken: string | null
   secureCookies: boolean
   trustProxy: boolean
-  provider: 'mock' | 'fal'
+  provider: 'mock' | 'fal' | 'orange'
   seedDemoQueue: boolean
   falKey: string | null
   falModel: string
+  orangeApiBase: string
+  orangeApiKey: string | null
+  orangeModel: string
+  orangeDurationSeconds: number
+  orangeResolution: string
+  orangeRatio: string
+  orangeWatermark: boolean
+  orangePollIntervalMs: number
   generationConcurrency: number
+  generationMaximumAttempts: number
   bufferTarget: number
   workerIntervalMs: number
   rotationIntervalMs: number
@@ -41,7 +50,15 @@ export function loadConfig(
   environment: NodeJS.ProcessEnv = process.env,
   workingDirectory = process.cwd(),
 ): RuntimeConfig {
-  const provider = environment.VIDEO_PROVIDER === 'fal' || environment.FAL_KEY ? 'fal' : 'mock'
+  const requestedProvider = environment.VIDEO_PROVIDER?.trim().toLocaleLowerCase('en')
+  if (requestedProvider && !['mock', 'fal', 'orange'].includes(requestedProvider)) {
+    throw new Error('VIDEO_PROVIDER must be mock, fal, or orange')
+  }
+  const provider = requestedProvider === 'orange'
+    ? 'orange'
+    : requestedProvider === 'fal' || (!requestedProvider && environment.FAL_KEY)
+      ? 'fal'
+      : 'mock'
   return {
     host: environment.HOST?.trim() || '127.0.0.1',
     port: integerValue(environment.PORT, 8787, 1, 65_535),
@@ -52,10 +69,19 @@ export function loadConfig(
     secureCookies: booleanValue(environment.SECURE_COOKIES, environment.NODE_ENV === 'production'),
     trustProxy: booleanValue(environment.TRUST_PROXY, false),
     provider,
-    seedDemoQueue: booleanValue(environment.SEED_DEMO_QUEUE, provider === 'mock'),
+    seedDemoQueue: provider === 'mock' && booleanValue(environment.SEED_DEMO_QUEUE, true),
     falKey: environment.FAL_KEY?.trim() || null,
     falModel: environment.FAL_MODEL?.trim() || 'minimax/h3-max/text-to-video',
+    orangeApiBase: environment.ORANGE_API_BASE?.trim() || 'https://api.orangeapi.chat/v1',
+    orangeApiKey: environment.ORANGE_API_KEY?.trim() || null,
+    orangeModel: environment.ORANGE_MODEL?.trim() || 'happyhorse-1.0-t2v',
+    orangeDurationSeconds: integerValue(environment.ORANGE_DURATION_SECONDS, 3, 1, 15),
+    orangeResolution: environment.ORANGE_RESOLUTION?.trim() || '720P',
+    orangeRatio: environment.ORANGE_RATIO?.trim() || '16:9',
+    orangeWatermark: booleanValue(environment.ORANGE_WATERMARK, true),
+    orangePollIntervalMs: integerValue(environment.ORANGE_POLL_INTERVAL_MS, 2_000, 250, 60_000),
     generationConcurrency: integerValue(environment.GENERATION_CONCURRENCY, 1, 1, 4),
+    generationMaximumAttempts: integerValue(environment.GENERATION_MAX_ATTEMPTS, 3, 1, 10),
     bufferTarget: integerValue(environment.BUFFER_TARGET, 4, 1, 20),
     workerIntervalMs: integerValue(environment.WORKER_INTERVAL_MS, 750, 100, 60_000),
     rotationIntervalMs: integerValue(environment.ROTATION_INTERVAL_MS, 500, 100, 10_000),

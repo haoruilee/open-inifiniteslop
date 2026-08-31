@@ -31,7 +31,7 @@ export type ChannelSnapshot = {
     isLive: boolean
     viewers: number
     likes: number
-    provider: 'mock' | 'fal'
+    provider: 'mock' | 'fal' | 'orange'
   }
   nowPlaying: ChannelIdea | null
   playingNext: ChannelIdea[]

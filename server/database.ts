@@ -433,13 +433,20 @@ export class ChannelDatabase {
     const now = this.now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const result = this.db.prepare(`
+      const ambiguous = this.db.prepare(`
+        UPDATE ideas
+        SET status = 'failed', status_changed_at = ?, generation_progress = 'submission_state_unknown',
+            error = 'orange_submission_state_unknown', retry_at = NULL
+        WHERE status = 'generating' AND provider = 'orange' AND provider_request_id IS NULL
+      `).run(now)
+      const resumable = this.db.prepare(`
         UPDATE ideas
         SET status = 'queued', status_changed_at = ?, generation_progress = 'recovered_after_restart',
             error = NULL, retry_at = NULL
         WHERE status = 'generating'
+          AND (COALESCE(provider, '') != 'orange' OR provider_request_id IS NOT NULL)
       `).run(now)
-      const changed = Number(result.changes) > 0
+      const changed = Number(ambiguous.changes) > 0 || Number(resumable.changes) > 0
       const revision = changed ? this.bumpRevision(now) : this.getRevision()
       this.db.exec('COMMIT')
       return { changed, revision }
@@ -477,11 +484,13 @@ export class ChannelDatabase {
       }
       this.db.prepare(`
         UPDATE ideas
-        SET status = 'generating', status_changed_at = ?, provider = ?,
+        SET status = 'generating', status_changed_at = ?,
+            provider_request_id = CASE WHEN provider IS NULL OR provider = ? THEN provider_request_id ELSE NULL END,
+            provider = ?,
             generation_progress = 'starting', error = NULL, retry_at = NULL,
             generation_attempts = generation_attempts + 1
         WHERE id = ? AND status = 'queued'
-      `).run(now, provider, row.id)
+      `).run(now, provider, provider, row.id)
       this.bumpRevision(now)
       this.db.exec('COMMIT')
       return this.getIdea(row.id)

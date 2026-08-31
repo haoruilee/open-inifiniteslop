@@ -103,3 +103,23 @@ test('rejects duplicate active prompts within the deduplication window', () => {
     database.close()
   }
 })
+
+test('keeps a provider task id for safe resume but clears it when providers change', () => {
+  const database = new ChannelDatabase(':memory:', { seed: false })
+  try {
+    const resumed = database.createSubmission(
+      'resume-visitor',
+      'resume',
+      'a tiny paper city at sunrise',
+      moderatePrompt('a tiny paper city at sunrise'),
+    ).idea
+    database.claimNextForGeneration('orange')
+    database.updateGenerationProgress(resumed.id, 'provider_queued', 'orange-task-resume')
+    database.failGeneration(resumed.id, 'provider_timeout', 0)
+    assert.equal(database.claimNextForGeneration('orange')?.providerRequestId, 'orange-task-resume')
+    database.failGeneration(resumed.id, 'manual_switch', 0)
+    assert.equal(database.claimNextForGeneration('fal')?.providerRequestId, null)
+  } finally {
+    database.close()
+  }
+})

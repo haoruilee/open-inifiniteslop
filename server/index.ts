@@ -16,6 +16,7 @@ const orchestrator = new ChannelOrchestrator(database, provider, {
   bufferTarget: config.bufferTarget,
   workerIntervalMs: config.workerIntervalMs,
   rotationIntervalMs: config.rotationIntervalMs,
+  maximumAttempts: config.generationMaximumAttempts,
 }, app.broadcast)
 
 app.server.listen(config.port, config.host, () => {

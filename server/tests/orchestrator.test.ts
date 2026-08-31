@@ -197,3 +197,31 @@ test('requeues generation interrupted by a process restart', () => {
     database.close()
   }
 })
+
+test('fails closed on an interrupted Orange submission with no persisted task id', () => {
+  const database = new ChannelDatabase(':memory:', { seed: false })
+  try {
+    const unknown = submit(database, 'unknown', 'an orange kite above a quiet valley')
+    database.claimNextForGeneration('orange')
+    assert.equal(database.requeueInterruptedGeneration().changed, true)
+    assert.equal(database.getIdea(unknown.id).status, 'failed')
+    assert.equal(database.getIdea(unknown.id).generationProgress, 'submission_state_unknown')
+    assert.equal(database.getIdea(unknown.id).error, 'orange_submission_state_unknown')
+  } finally {
+    database.close()
+  }
+})
+
+test('requeues an interrupted Orange task only after its task id is persisted', () => {
+  const database = new ChannelDatabase(':memory:', { seed: false })
+  try {
+    const resumable = submit(database, 'resumable', 'an orange lantern floating over water')
+    database.claimNextForGeneration('orange')
+    database.updateGenerationProgress(resumable.id, 'provider_queued', 'persisted-orange-task')
+    assert.equal(database.requeueInterruptedGeneration().changed, true)
+    assert.equal(database.getIdea(resumable.id).status, 'queued')
+    assert.equal(database.getIdea(resumable.id).providerRequestId, 'persisted-orange-task')
+  } finally {
+    database.close()
+  }
+})
