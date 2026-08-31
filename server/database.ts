@@ -112,6 +112,8 @@ const schema = `
     ON ideas(status, status_changed_at, created_at, id);
   CREATE INDEX IF NOT EXISTS ideas_queue_order
     ON ideas(status, created_at, id);
+  CREATE UNIQUE INDEX IF NOT EXISTS ideas_single_playing
+    ON ideas(status) WHERE status = 'playing';
   CREATE INDEX IF NOT EXISTS chat_recent
     ON chat_messages(created_at DESC, id DESC);
   CREATE INDEX IF NOT EXISTS votes_by_idea
@@ -595,25 +597,38 @@ export class ChannelDatabase {
       `).get() as { id: number; status_changed_at: number; duration_seconds: number } | undefined
 
       let needsNext = !current
+      let justAiredId: number | null = null
       if (current && now - Number(current.status_changed_at) >= Number(current.duration_seconds) * 1_000) {
         this.db.prepare(`
           UPDATE ideas SET status = 'aired', status_changed_at = ? WHERE id = ? AND status = 'playing'
         `).run(now, current.id)
         changed = true
         needsNext = true
+        justAiredId = current.id
       }
 
       if (needsNext) {
-        const next = this.db.prepare(`
-          SELECT id FROM ideas WHERE status = 'ready'
+        const fresh = this.db.prepare(`
+          SELECT id, status FROM ideas WHERE status = 'ready'
           ORDER BY status_changed_at ASC, id ASC LIMIT 1
-        `).get() as { id: number } | undefined
+        `).get() as { id: number; status: 'ready' } | undefined
+        const replay = fresh ? undefined : this.db.prepare(`
+          SELECT id, status FROM ideas
+          WHERE status = 'aired' AND (video_url IS NOT NULL OR video_path IS NOT NULL)
+          ORDER BY
+            CASE WHEN id = ? THEN 1 ELSE 0 END,
+            play_count ASC,
+            status_changed_at ASC,
+            id ASC
+          LIMIT 1
+        `).get(justAiredId ?? -1) as { id: number; status: 'aired' } | undefined
+        const next = fresh ?? replay
         if (next) {
           this.db.prepare(`
             UPDATE ideas
             SET status = 'playing', status_changed_at = ?, play_count = play_count + 1
-            WHERE id = ? AND status = 'ready'
-          `).run(now, next.id)
+            WHERE id = ? AND status = ?
+          `).run(now, next.id, next.status)
           changed = true
         }
       }

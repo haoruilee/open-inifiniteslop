@@ -123,3 +123,100 @@ test('keeps a provider task id for safe resume but clears it when providers chan
     database.close()
   }
 })
+
+function markReady(database: ChannelDatabase, ideaId: number, durationSeconds = 1) {
+  database.claimNextForGeneration('mock')
+  database.completeGeneration(ideaId, {
+    videoUrl: `/assets/mock-loop-${ideaId}.mp4`,
+    videoPath: null,
+    posterUrl: '/assets/tv-frame.png',
+    durationSeconds,
+    providerRequestId: `mock-${ideaId}`,
+  })
+}
+
+test('replays one archived clip instead of leaving the channel empty', () => {
+  let now = 10_000
+  const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })
+  try {
+    const idea = database.createSubmission(
+      'loop-viewer',
+      'loop',
+      'a paper moon floats over a quiet city',
+      moderatePrompt('a paper moon floats over a quiet city'),
+    ).idea
+    markReady(database, idea.id)
+    database.advancePlayback()
+    assert.equal(database.snapshot().nowPlaying?.id, idea.id)
+
+    now += 1_001
+    database.advancePlayback()
+    assert.equal(database.snapshot().nowPlaying?.id, idea.id)
+    assert.equal(database.getIdea(idea.id).status, 'playing')
+    assert.equal(database.getIdea(idea.id).playCount, 2)
+  } finally {
+    database.close()
+  }
+})
+
+test('rotates archived clips without immediately repeating the clip that just aired', () => {
+  let now = 20_000
+  const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })
+  try {
+    const first = database.createSubmission(
+      'first-viewer',
+      'first',
+      'a tiny orange ferry crosses a glass lake',
+      moderatePrompt('a tiny orange ferry crosses a glass lake'),
+    ).idea
+    markReady(database, first.id)
+    const second = database.createSubmission(
+      'second-viewer',
+      'second',
+      'a silver tram travels through a cloud city',
+      moderatePrompt('a silver tram travels through a cloud city'),
+    ).idea
+    markReady(database, second.id)
+
+    database.advancePlayback()
+    assert.equal(database.snapshot().nowPlaying?.id, first.id)
+    now += 1_001
+    database.advancePlayback()
+    assert.equal(database.snapshot().nowPlaying?.id, second.id)
+    now += 1_001
+    database.advancePlayback()
+    assert.equal(database.snapshot().nowPlaying?.id, first.id)
+  } finally {
+    database.close()
+  }
+})
+
+test('plays a freshly generated clip before replaying the archive', () => {
+  let now = 30_000
+  const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })
+  try {
+    const archived = database.createSubmission(
+      'archive-viewer',
+      'archive',
+      'a miniature lighthouse inside a snow globe',
+      moderatePrompt('a miniature lighthouse inside a snow globe'),
+    ).idea
+    markReady(database, archived.id)
+    database.advancePlayback()
+
+    const fresh = database.createSubmission(
+      'fresh-viewer',
+      'fresh',
+      'a friendly robot paints a sunrise mural',
+      moderatePrompt('a friendly robot paints a sunrise mural'),
+    ).idea
+    markReady(database, fresh.id)
+    now += 1_001
+    database.advancePlayback()
+
+    assert.equal(database.snapshot().nowPlaying?.id, fresh.id)
+    assert.equal(database.getIdea(archived.id).status, 'aired')
+  } finally {
+    database.close()
+  }
+})
