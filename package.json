@@ -12,6 +12,8 @@
     "build": "pnpm build:client && pnpm build:server",
     "test": "NODE_ENV=test tsx --test server/tests/*.test.ts",
     "start": "node server-dist/index.js",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "pnpm test && pnpm build && pnpm smoke",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

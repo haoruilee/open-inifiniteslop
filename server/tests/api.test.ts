@@ -337,3 +337,42 @@ test('serves provider-downloaded media with immutable byte ranges', async () => 
     await server.close()
   }
 })
+
+test('serves the production SPA without exposing paths outside dist', async () => {
+  const server = await startTestServer()
+  try {
+    mkdirSync(join(server.config.staticDir, 'assets'), { recursive: true })
+    writeFileSync(join(server.config.staticDir, 'index.html'), '<!doctype html><title>Infinite Slop test</title><div id="root"></div>')
+    writeFileSync(join(server.config.staticDir, 'assets', 'app-abcdefgh.js'), 'console.log("ok")')
+    writeFileSync(join(server.config.staticDir, 'assets', 'clip.mp4'), Buffer.from('0123456789abcdef'))
+
+    const home = await server.request('/', { headers: { Accept: 'text/html' } })
+    assert.equal(home.status, 200)
+    assert.equal(home.headers.get('cache-control'), 'no-cache')
+    assert.match(await home.text(), /Infinite Slop test/u)
+
+    const routeFallback = await server.request('/channel/live', { headers: { Accept: 'text/html' } })
+    assert.equal(routeFallback.status, 200)
+    assert.match(await routeFallback.text(), /Infinite Slop test/u)
+
+    const asset = await server.request('/assets/app-abcdefgh.js')
+    assert.equal(asset.status, 200)
+    assert.equal(asset.headers.get('cache-control'), 'public, max-age=31536000, immutable')
+    const tag = asset.headers.get('etag')
+    assert.ok(tag)
+    const notModified = await server.request('/assets/app-abcdefgh.js', { headers: { 'If-None-Match': tag } })
+    assert.equal(notModified.status, 304)
+
+    const partial = await server.request('/assets/clip.mp4', { headers: { Range: 'bytes=3-7' } })
+    assert.equal(partial.status, 206)
+    assert.equal(await partial.text(), '34567')
+
+    for (const path of ['/assets/missing.js', '/.git/config', '/data/channel.sqlite', '/server/index.ts']) {
+      const response = await server.request(path, { headers: { Accept: 'text/html' } })
+      assert.equal(response.status, 404, path)
+      assert.match(response.headers.get('content-type') || '', /^application\/json/u)
+    }
+  } finally {
+    await server.close()
+  }
+})

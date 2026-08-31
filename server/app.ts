@@ -13,6 +13,7 @@ import {
 import { moderatePrompt, normalizePrompt } from './moderation.js'
 import { FixedWindowRateLimiter } from './rate-limit.js'
 import { SseHub } from './sse.js'
+import { serveStatic, StaticRequestError } from './static.js'
 import type { ChannelSnapshot, PublicIdea } from './types.js'
 
 const nicknameSchema = z.string()
@@ -491,6 +492,8 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
       if (pathname.startsWith('/api/') || pathname === '/status.json') {
         throw new HttpError(404, 'NOT_FOUND', 'API route not found')
       }
+      const rawPathname = (request.url || '/').split('?', 1)[0]
+      if (serveStatic(request, response, config.staticDir, rawPathname, pathname)) return
       throw new HttpError(404, 'NOT_FOUND', 'Not found')
     } catch (error) {
       if (response.headersSent) {
@@ -505,6 +508,8 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
         apiError(response, new HttpError(409, 'INVALID_STATE', error.message))
       } else if (error instanceof NotFoundError) {
         apiError(response, new HttpError(404, 'NOT_FOUND', error.message))
+      } else if (error instanceof StaticRequestError) {
+        apiError(response, new HttpError(error.status, 'INVALID_STATIC_PATH', error.message))
       } else {
         console.error(JSON.stringify({ requestId, event: 'request_failed', error: error instanceof Error ? error.name : 'UnknownError' }))
         apiError(response, new HttpError(500, 'INTERNAL_ERROR', 'Internal server error'))
