@@ -85,7 +85,7 @@ try {
   assert.match(home.headers.get('content-type') || '', /^text\/html/u)
   const html = await home.text()
   assert.match(html, /Infinite Slop/u)
-  const assetPath = html.match(/(?:src|href)="(\/assets\/[^"]+)"/u)?.[1]
+  const assetPath = html.match(/(?:src|href)="(\/assets\/[^"/]+-[A-Za-z0-9_-]{8,}\.[^"]+)"/u)?.[1]
   assert.ok(assetPath)
   const asset = await fetch(`${origin}${assetPath}`)
   assert.equal(asset.status, 200)

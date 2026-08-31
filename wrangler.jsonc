@@ -31,13 +31,6 @@
       "id": "188413eca15a4cd4aa755dfdd06ddcca"
     }
   ],
-  "workflows": [
-    {
-      "name": "infinite-slop-video-generation",
-      "binding": "VIDEO_WORKFLOW",
-      "class_name": "VideoGenerationWorkflow"
-    }
-  ],
   "vars": {
     "ORANGE_API_BASE": "https://api.orangeapi.chat/v1",
     "ORANGE_MODEL": "wan2.7-t2v",

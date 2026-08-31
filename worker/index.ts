@@ -1,19 +1,7 @@
-import {
-  WorkflowEntrypoint,
-  type WorkflowEvent,
-  type WorkflowStep,
-} from 'cloudflare:workers'
-import { NonRetryableError } from 'cloudflare:workflows'
 import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
 import { mp4DurationSeconds } from './mp4-duration.js'
 
-type GenerationParams = {
-  ideaId: number
-  taskId: string
-}
-
-type WorkerEnv = Omit<Env, 'VIDEO_WORKFLOW'> & {
-  VIDEO_WORKFLOW: Workflow<GenerationParams>
+type WorkerEnv = Env & {
   ORANGE_API_KEY?: string
   TEXT_POLISH_API_KEY?: string
   ADMIN_TOKEN?: string
@@ -51,6 +39,9 @@ type IdeaRow = {
   play_count: number
   generation_attempts: number
   workflow_id: string | null
+  generation_next_poll_at: number | null
+  generation_poll_lease_until: number | null
+  generation_poll_token: string | null
 }
 
 type PublicIdea = {
@@ -101,6 +92,12 @@ type OrangeTaskState = {
   error: string | null
 }
 
+type GenerationPollClaim = {
+  ideaId: number
+  taskId: string
+  token: string
+}
+
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
 const defaultArchiveLimit = 100
@@ -118,10 +115,10 @@ const textPolishSystemPrompt = [
   'sexual content, graphic violence, dangerous instructions, or external references.',
   'Return only the rewritten prompt and keep it under 700 characters.',
 ].join(' ')
-// Long-form providers can remain queued for several minutes; the task ID is
-// persisted first, so extending polling never creates a duplicate generation.
-const maximumPolls = 180
 const staleGenerationMs = 30 * 60_000
+const generationPollIntervalMs = 55_000
+const generationPollLeaseMs = 5 * 60_000
+const maximumGenerationPollsPerTick = 8
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
 const channelBotPrompts = [
@@ -657,39 +654,14 @@ async function failGeneration(env: WorkerEnv, ideaId: number, progress: string, 
   const now = Date.now()
   const updated = await env.DB.prepare(`
     UPDATE ideas
-    SET status = 'failed', status_changed_at = ?, generation_progress = ?, error = ?
+    SET status = 'failed', status_changed_at = ?, generation_progress = ?, error = ?,
+        generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL
     WHERE id = ? AND status = 'generating'
   `).bind(now, progress, error.slice(0, 240), ideaId).run()
   if (Number(updated.meta.changes ?? 0) > 0) await bumpRevision(env, now)
 }
 
-async function startPollingWorkflow(env: WorkerEnv, ideaId: number, taskId: string, workflowId: string) {
-  try {
-    await env.VIDEO_WORKFLOW.create({
-      id: workflowId,
-      params: { ideaId, taskId },
-      retention: { successRetention: '1 day', errorRetention: '3 days' },
-      locationHint: 'apac',
-    })
-    return true
-  } catch (error) {
-    try {
-      const status = await (await env.VIDEO_WORKFLOW.get(workflowId)).status()
-      if (['queued', 'running', 'waiting', 'paused', 'waitingForPause'].includes(status.status)) return true
-    } catch {
-      // A failed create is not safe to retry with a new paid provider request.
-    }
-    await failGeneration(
-      env,
-      ideaId,
-      'workflow_start_failed',
-      error instanceof Error ? error.message : 'workflow_start_failed',
-    )
-    return false
-  }
-}
-
-async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: string) {
+async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
   const idea = await env.DB.prepare(`
     SELECT id, author, body, provider_request_id, requested_duration_seconds, requested_model
     FROM ideas WHERE id = ? AND status = 'generating'
@@ -702,9 +674,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
     requested_model: string | null
   }>()
   if (!idea) return false
-  if (idea.provider_request_id) {
-    return startPollingWorkflow(env, ideaId, idea.provider_request_id, workflowId)
-  }
+  if (idea.provider_request_id) return true
   if (!(await reserveGenerationBudget(env))) {
     await failGeneration(env, ideaId, 'daily_budget_exhausted', 'daily_generation_budget_exhausted')
     return false
@@ -744,9 +714,10 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
     const persisted = await env.DB.prepare(`
       UPDATE ideas
       SET provider_request_id = ?, requested_duration_seconds = ?, requested_model = ?,
-          generation_progress = 'provider_queued', error = NULL
+          generation_progress = 'provider_queued', generation_next_poll_at = ?,
+          generation_poll_lease_until = NULL, generation_poll_token = NULL, error = NULL
       WHERE id = ? AND status = 'generating' AND provider_request_id IS NULL
-    `).bind(taskId, durationSeconds, model, ideaId).run()
+    `).bind(taskId, durationSeconds, model, Date.now(), ideaId).run()
     if (Number(persisted.meta.changes ?? 0) === 0) {
       throw new Error('orange_submission_persist_failed')
     }
@@ -762,7 +733,191 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
     )
     return false
   }
-  return startPollingWorkflow(env, ideaId, taskId, workflowId)
+  return true
+}
+
+async function claimDueGenerationPolls(env: WorkerEnv) {
+  const now = Date.now()
+  const candidates = await rows<{ id: number; provider_request_id: string }>(env.DB.prepare(`
+    SELECT id, provider_request_id
+    FROM ideas
+    WHERE status = 'generating' AND provider_request_id IS NOT NULL
+      AND (generation_next_poll_at IS NULL OR generation_next_poll_at <= ?)
+      AND (generation_poll_lease_until IS NULL OR generation_poll_lease_until <= ?)
+    ORDER BY status_changed_at ASC, id ASC
+    LIMIT ?
+  `).bind(now, now, Math.min(configuredBufferTarget(env), maximumGenerationPollsPerTick)))
+
+  const claims: GenerationPollClaim[] = []
+  for (const candidate of candidates) {
+    const token = crypto.randomUUID()
+    const leased = await env.DB.prepare(`
+      UPDATE ideas
+      SET generation_progress = 'polling', generation_poll_token = ?,
+          generation_poll_lease_until = ?, generation_next_poll_at = ?, error = NULL
+      WHERE id = ? AND status = 'generating' AND provider_request_id = ?
+        AND (generation_next_poll_at IS NULL OR generation_next_poll_at <= ?)
+        AND (generation_poll_lease_until IS NULL OR generation_poll_lease_until <= ?)
+    `).bind(
+      token,
+      now + generationPollLeaseMs,
+      now + generationPollIntervalMs,
+      candidate.id,
+      candidate.provider_request_id,
+      now,
+      now,
+    ).run()
+    if (Number(leased.meta.changes ?? 0) > 0) {
+      claims.push({ ideaId: Number(candidate.id), taskId: candidate.provider_request_id, token })
+    }
+  }
+  return claims
+}
+
+async function releaseGenerationPoll(
+  env: WorkerEnv,
+  claim: GenerationPollClaim,
+  progress: 'provider_pending' | 'provider_retry',
+  error: string | null,
+) {
+  const now = Date.now()
+  await env.DB.prepare(`
+    UPDATE ideas
+    SET generation_progress = ?, generation_next_poll_at = ?, generation_poll_lease_until = NULL,
+        generation_poll_token = NULL, error = ?
+    WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
+  `).bind(
+    progress,
+    now + generationPollIntervalMs,
+    error ? error.slice(0, 240) : null,
+    claim.ideaId,
+    claim.token,
+  ).run()
+}
+
+async function failClaimedGeneration(
+  env: WorkerEnv,
+  claim: GenerationPollClaim,
+  progress: string,
+  error: string,
+) {
+  const now = Date.now()
+  const updated = await env.DB.prepare(`
+    UPDATE ideas
+    SET status = 'failed', status_changed_at = ?, generation_progress = ?, error = ?,
+        generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL
+    WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
+  `).bind(now, progress, error.slice(0, 240), claim.ideaId, claim.token).run()
+  if (Number(updated.meta.changes ?? 0) > 0) await bumpRevision(env, now)
+}
+
+class TerminalGenerationError extends Error {}
+
+async function storeCompletedVideo(env: WorkerEnv, claim: GenerationPollClaim, resultUrl: string) {
+  const idea = await env.DB.prepare(`
+    SELECT id, author, requested_duration_seconds, requested_model
+    FROM ideas
+    WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
+  `).bind(claim.ideaId, claim.token).first<{
+    id: number
+    author: string
+    requested_duration_seconds: number | null
+    requested_model: string | null
+  }>()
+  if (!idea) return false
+
+  const storing = await env.DB.prepare(`
+    UPDATE ideas SET generation_progress = 'storing'
+    WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
+  `).bind(claim.ideaId, claim.token).run()
+  if (Number(storing.meta.changes ?? 0) === 0) return false
+
+  const response = await fetch(resultUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InfiniteAISlop/1.0)' },
+    signal: AbortSignal.timeout(120_000),
+  })
+  if (!response.ok) throw new Error(`orange_media_http_${response.status}`)
+  const declaredLength = Number(response.headers.get('Content-Length') || 0)
+  if (declaredLength > maximumVideoBytes) throw new TerminalGenerationError('video_exceeds_kv_limit_enable_r2')
+  const bytes = await response.arrayBuffer()
+  if (bytes.byteLength > maximumVideoBytes) throw new TerminalGenerationError('video_exceeds_kv_limit_enable_r2')
+
+  const archived = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM ideas WHERE video_key IS NOT NULL
+  `).first<{ count: number }>()
+  if (Number(archived?.count ?? 0) >= configuredArchiveLimit(env)) {
+    const stale = await env.DB.prepare(`
+      SELECT id, video_key FROM ideas
+      WHERE status = 'aired' AND video_key IS NOT NULL
+      ORDER BY status_changed_at ASC, id ASC LIMIT 1
+    `).first<{ id: number; video_key: string }>()
+    if (stale) {
+      const cleared = await env.DB.prepare(`
+        UPDATE ideas SET video_key = NULL
+        WHERE id = ? AND status = 'aired' AND video_key = ?
+      `).bind(stale.id, stale.video_key).run()
+      if (Number(cleared.meta.changes ?? 0) > 0) await env.VIDEO_MEDIA.delete(stale.video_key)
+    }
+  }
+
+  const key = `videos/${claim.ideaId}.mp4`
+  await env.VIDEO_MEDIA.put(key, bytes, {
+    metadata: { contentType: response.headers.get('Content-Type') || 'video/mp4' },
+  })
+  const now = Date.now()
+  const published = await env.DB.prepare(`
+    UPDATE ideas
+    SET status = 'ready', status_changed_at = ?, video_key = ?, poster_url = '/assets/tv-frame.png',
+        duration_seconds = ?, generation_progress = 'complete', error = NULL,
+        generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL
+    WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
+  `).bind(
+    now,
+    key,
+    mp4DurationSeconds(new Uint8Array(bytes)) ?? durationForIdea(env, idea),
+    claim.ideaId,
+    claim.token,
+  ).run()
+  if (Number(published.meta.changes ?? 0) > 0) {
+    await bumpRevision(env, now)
+    return true
+  }
+  return false
+}
+
+async function pollClaimedGeneration(env: WorkerEnv, claim: GenerationPollClaim) {
+  try {
+    const response = await fetch(
+      `${env.ORANGE_API_BASE.replace(/\/+$/u, '')}/video/generations/${encodeURIComponent(claim.taskId)}`,
+      { headers: orangeHeaders(env), signal: AbortSignal.timeout(30_000) },
+    )
+    const state = taskStateFrom(await parseOrangeJson(response))
+    if (state.status === 'failed') {
+      await failClaimedGeneration(env, claim, 'provider_failed', state.error || 'orange_generation_failed')
+      return
+    }
+    if (state.status === 'pending') {
+      await releaseGenerationPoll(env, claim, 'provider_pending', null)
+      return
+    }
+    if (!state.resultUrl) {
+      await failClaimedGeneration(env, claim, 'provider_result_invalid', 'orange_result_url_missing')
+      return
+    }
+    await storeCompletedVideo(env, claim, state.resultUrl)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'generation_poll_failed'
+    if (error instanceof TerminalGenerationError) {
+      await failClaimedGeneration(env, claim, 'terminal_generation_error', message)
+      return
+    }
+    await releaseGenerationPoll(env, claim, 'provider_retry', message)
+  }
+}
+
+async function pollGeneratingTasks(env: WorkerEnv) {
+  const claims = await claimDueGenerationPolls(env)
+  for (const claim of claims) await pollClaimedGeneration(env, claim)
 }
 
 async function dispatchQueued(env: WorkerEnv) {
@@ -779,16 +934,16 @@ async function dispatchQueued(env: WorkerEnv) {
     if (!next) return
 
     const now = Date.now()
-    const workflowId = `idea-${next.id}`
     const claimed = await env.DB.prepare(`
       UPDATE ideas
       SET status = 'generating', status_changed_at = ?, generation_progress = 'submitting',
-          error = NULL, generation_attempts = generation_attempts + 1, workflow_id = ?
+          generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL,
+          error = NULL, generation_attempts = generation_attempts + 1, workflow_id = NULL
       WHERE id = ? AND status = 'queued'
-    `).bind(now, workflowId, next.id).run()
+    `).bind(now, next.id).run()
     if (Number(claimed.meta.changes ?? 0) === 0) continue
     await bumpRevision(env, now)
-    await submitOrangeTaskOnce(env, next.id, workflowId)
+    await submitOrangeTaskOnce(env, next.id)
   }
 }
 
@@ -796,7 +951,8 @@ async function reconcileStaleGenerations(env: WorkerEnv) {
   const now = Date.now()
   const stale = await env.DB.prepare(`
     UPDATE ideas
-    SET status = 'failed', status_changed_at = ?, generation_progress = 'stale_timeout', error = 'generation_timed_out'
+    SET status = 'failed', status_changed_at = ?, generation_progress = 'stale_timeout', error = 'generation_timed_out',
+        generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL
     WHERE status = 'generating' AND status_changed_at < ?
   `).bind(now, now - staleGenerationMs).run()
   if (Number(stale.meta.changes ?? 0) > 0) await bumpRevision(env, now)
@@ -1201,7 +1357,7 @@ function taskStateFrom(payload: Record<string, unknown>): OrangeTaskState {
 }
 
 function orangeHeaders(env: WorkerEnv, includeJson = false) {
-  if (!env.ORANGE_API_KEY) throw new NonRetryableError('orange_api_key_missing')
+  if (!env.ORANGE_API_KEY) throw new TerminalGenerationError('orange_api_key_missing')
   const headers = new Headers({
     Authorization: `Bearer ${env.ORANGE_API_KEY}`,
     'User-Agent': 'Mozilla/5.0 (compatible; InfiniteAISlop/1.0)',
@@ -1209,112 +1365,6 @@ function orangeHeaders(env: WorkerEnv, includeJson = false) {
   })
   if (includeJson) headers.set('Content-Type', 'application/json')
   return headers
-}
-
-export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, GenerationParams> {
-  async run(event: Readonly<WorkflowEvent<GenerationParams>>, step: WorkflowStep) {
-    const ideaId = event.payload.ideaId
-    try {
-      const taskId = event.payload.taskId
-      await step.do('verify submitted provider task', async () => {
-        const row = await this.env.DB.prepare(`
-          SELECT id, status, provider_request_id FROM ideas WHERE id = ?
-        `).bind(ideaId).first<{ id: number; status: IdeaStatus; provider_request_id: string | null }>()
-        if (!row || row.status !== 'generating') throw new NonRetryableError('idea_not_generating')
-        if (row.provider_request_id !== taskId) throw new NonRetryableError('provider_task_mismatch')
-      })
-
-      let resultUrl: string | null = null
-      for (let poll = 0; poll < maximumPolls; poll += 1) {
-        const state = await step.do(`poll Orange task ${poll + 1}`, async () => {
-          const response = await fetch(
-            `${this.env.ORANGE_API_BASE.replace(/\/+$/u, '')}/video/generations/${encodeURIComponent(taskId)}`,
-            { headers: orangeHeaders(this.env) },
-          )
-          return taskStateFrom(await parseOrangeJson(response))
-        })
-        if (state.status === 'failed') throw new NonRetryableError(state.error || 'orange_generation_failed')
-        if (state.status === 'success') {
-          if (!state.resultUrl) throw new NonRetryableError('orange_result_url_missing')
-          resultUrl = state.resultUrl
-          break
-        }
-        await step.sleep(`wait before poll ${poll + 1}`, '5 seconds')
-      }
-      if (!resultUrl) throw new NonRetryableError('orange_generation_timeout')
-
-      const storedVideo = await step.do('persist generated video in KV', async () => {
-        const response = await fetch(resultUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InfiniteAISlop/1.0)' },
-        })
-        if (!response.ok) throw new Error(`orange_media_http_${response.status}`)
-        const declaredLength = Number(response.headers.get('Content-Length') || 0)
-        if (declaredLength > maximumVideoBytes) throw new NonRetryableError('video_exceeds_kv_limit_enable_r2')
-        const bytes = await response.arrayBuffer()
-        if (bytes.byteLength > maximumVideoBytes) throw new NonRetryableError('video_exceeds_kv_limit_enable_r2')
-        const archived = await this.env.DB.prepare(`
-          SELECT COUNT(*) AS count FROM ideas WHERE video_key IS NOT NULL
-        `).first<{ count: number }>()
-        if (Number(archived?.count ?? 0) >= configuredArchiveLimit(this.env)) {
-          const stale = await this.env.DB.prepare(`
-            SELECT id, video_key FROM ideas
-            WHERE status = 'aired' AND video_key IS NOT NULL
-            ORDER BY status_changed_at ASC, id ASC LIMIT 1
-          `).first<{ id: number; video_key: string }>()
-          if (stale) {
-            const cleared = await this.env.DB.prepare(`
-              UPDATE ideas SET video_key = NULL
-              WHERE id = ? AND status = 'aired' AND video_key = ?
-            `).bind(stale.id, stale.video_key).run()
-            if (Number(cleared.meta.changes ?? 0) > 0) {
-              await this.env.VIDEO_MEDIA.delete(stale.video_key)
-            }
-          }
-        }
-        const key = `videos/${ideaId}.mp4`
-        await this.env.VIDEO_MEDIA.put(key, bytes, {
-          metadata: { contentType: response.headers.get('Content-Type') || 'video/mp4' },
-        })
-        return { key, durationSeconds: mp4DurationSeconds(new Uint8Array(bytes)) }
-      })
-
-      await step.do('publish generated video', async () => {
-        const now = Date.now()
-        const idea = await this.env.DB.prepare(`
-          SELECT id, author, requested_duration_seconds, requested_model
-          FROM ideas WHERE id = ? AND status = 'generating'
-        `).bind(ideaId).first<{
-          id: number
-          author: string
-          requested_duration_seconds: number | null
-          requested_model: string | null
-        }>()
-        if (!idea) throw new NonRetryableError('idea_publish_state_changed')
-        const updated = await this.env.DB.prepare(`
-          UPDATE ideas
-          SET status = 'ready', status_changed_at = ?, video_key = ?,
-              poster_url = '/assets/tv-frame.png', duration_seconds = ?,
-              generation_progress = 'complete', error = NULL
-          WHERE id = ? AND status = 'generating'
-        `).bind(now, storedVideo.key, storedVideo.durationSeconds ?? durationForIdea(this.env, idea), ideaId).run()
-        if (Number(updated.meta.changes ?? 0) === 0) throw new NonRetryableError('idea_publish_state_changed')
-        await bumpRevision(this.env, now)
-      })
-      return { ideaId, status: 'ready' }
-    } catch (error) {
-      await step.do('fail generation safely', async () => {
-        const now = Date.now()
-        const message = error instanceof Error ? error.message.slice(0, 240) : 'generation_failed'
-        const updated = await this.env.DB.prepare(`
-          UPDATE ideas
-          SET status = 'failed', status_changed_at = ?, generation_progress = 'failed', error = ?
-          WHERE id = ? AND status = 'generating'
-        `).bind(now, message, ideaId).run()
-        if (Number(updated.meta.changes ?? 0) > 0) await bumpRevision(this.env, now)
-      })
-      throw error
-    }
-  }
 }
 
 const worker: ExportedHandler<WorkerEnv> = {
@@ -1340,6 +1390,7 @@ const worker: ExportedHandler<WorkerEnv> = {
   async scheduled(_controller, env, execution) {
     execution.waitUntil((async () => {
       await reconcileStaleGenerations(env)
+      await pollGeneratingTasks(env)
       await queueChannelBotPrompt(env)
       await advancePlayback(env)
       await dispatchQueued(env)
