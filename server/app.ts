@@ -527,11 +527,15 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
     snapshot,
     broadcast,
     close: async () => {
-      hub.close()
-      await new Promise<void>((resolve, reject) => {
-        if (!server.listening) return resolve()
+      if (!server.listening) {
+        hub.close()
+        return
+      }
+      const closed = new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve())
       })
+      hub.close()
+      await closed
     },
   }
 }

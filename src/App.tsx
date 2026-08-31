@@ -1,4 +1,12 @@
 import { FormEvent, memo, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ChannelApiError,
+  type ChannelIdea,
+  likeChannel,
+  submitPrompt,
+  useChannel,
+  voteForIdea,
+} from './channel'
 
 type FeedItem = {
   id: number
@@ -10,37 +18,17 @@ type FeedItem = {
   mine?: boolean
 }
 
-const playingNext: FeedItem[] = [
-  { id: 1, time: '11:27', user: 'fede', message: 'orange cat becomes mayor of the moon' },
-  { id: 2, time: '11:27', user: 'larry', message: 'a tiny game show inside a teacup' },
-  { id: 3, time: '11:27', user: 'KiraKiraKaiju', message: 'clouds playing jazz at sunset' },
-  { id: 4, time: '11:28', user: 'alex', message: 'a friendly robot cooks noodles' },
-]
-
-const generatingNow: FeedItem[] = [
-  { id: 5, time: '11:28', user: 'dan', message: 'paint drying, literally', generating: true },
-  { id: 6, time: '11:28', user: 'BooBoo', message: 'a seed grows into a tree in a glass jar', generating: true },
-  { id: 7, time: '11:28', user: 'snow', message: 'a miniature orchestra made of clouds', generating: true },
-]
-
-const initialQueue: FeedItem[] = [
-  { id: 8, time: '11:28', user: 'curiouscat', message: 'breakfast floating in zero gravity', votes: 3 },
-  { id: 9, time: '11:28', user: 'vibey', message: 'friendly frogs host the evening news', votes: 2 },
-  { id: 10, time: '11:28', user: 'teacupTV', message: 'a paper boat adventure in the rain', votes: 1 },
-  { id: 11, time: '11:28', user: 'noodlebot', message: 'robots discover a jazz club on Mars', votes: 1 },
-]
-
-const initialChat: FeedItem[] = [
-  { id: 21, time: '11:27', user: 'cloudchaser', message: 'clouds playing jazz at sunset' },
-  { id: 22, time: '11:27', user: 'Yeroo', message: 'a cozy cabin in the snow with a cat by the fireplace' },
-  { id: 23, time: '11:27', user: 'Mira', message: 'tiny astronauts having a picnic on a keyboard' },
-  { id: 24, time: '11:28', user: 'Tribal', message: 'Brazil' },
-  { id: 25, time: '11:28', user: 'Ivan', message: 'should I build a treehouse or a tiny library?' },
-  { id: 26, time: '11:28', user: 'brian', message: 'a paper boat adventure in the rain' },
-  { id: 27, time: '11:28', user: 'Catcatcat', message: 'a hedgehog running a coffee shop' },
-  { id: 28, time: '11:28', user: 'brimstonecoal', message: 'friendly monsters cook breakfast together' },
-  { id: 29, time: '11:28', user: 'Catcatcat', message: 'a horse rides an elevator to the moon' },
-]
+function toFeedItem(idea: ChannelIdea, nickname: string): FeedItem {
+  return {
+    id: idea.id,
+    time: idea.time,
+    user: idea.user,
+    message: idea.message,
+    votes: idea.votes,
+    generating: idea.status === 'generating',
+    mine: nickname.length > 0 && idea.user === nickname,
+  }
+}
 
 function pastel(name: string) {
   let hue = 0
@@ -66,6 +54,20 @@ function useDeskQueue() {
   }, [])
 
   return isDesktop
+}
+
+function savedNickname() {
+  return window.localStorage.getItem('infinite-slop-nickname') || ''
+}
+
+function savedVotes() {
+  try {
+    const values = JSON.parse(window.localStorage.getItem('infinite-slop-votes') || '[]') as unknown
+    if (!Array.isArray(values)) return new Set<number>()
+    return new Set(values.filter((value): value is number => Number.isSafeInteger(value)))
+  } catch {
+    return new Set<number>()
+  }
 }
 
 const FalMark = memo(function FalMark() {
@@ -104,27 +106,55 @@ const FeedBubble = memo(function FeedBubble({ item, className = '' }: { item: Fe
   )
 })
 
-function QueuePanel({ queue, onVote }: { queue: FeedItem[]; onVote: (id: number) => void }) {
+function QueuePanel({
+  playingNext,
+  generatingNow,
+  queue,
+  onVote,
+  votedIds,
+  pendingVotes,
+}: {
+  playingNext: FeedItem[]
+  generatingNow: FeedItem[]
+  queue: FeedItem[]
+  onVote: (id: number) => void
+  votedIds: Set<number>
+  pendingVotes: Set<number>
+}) {
   return (
     <div className="queue-panel" data-testid="queue-panel">
       <h2>PLAYING NEXT</h2>
       <div className="feed-stack playing-stack">
-        {playingNext.map((item) => <FeedBubble key={item.id} item={item} />)}
+        {playingNext.length > 0
+          ? playingNext.map((item) => <FeedBubble key={item.id} item={item} />)
+          : <div className="empty-feed">buffering…</div>}
       </div>
       <h2>NOW GENERATING</h2>
       <div className="feed-stack">
-        {generatingNow.map((item) => <FeedBubble key={item.id} item={item} />)}
+        {generatingNow.length > 0
+          ? generatingNow.map((item) => <FeedBubble key={item.id} item={item} />)
+          : <div className="empty-feed">waiting for a prompt…</div>}
       </div>
       <h2>QUEUE</h2>
       <div className="feed-stack">
-        {queue.map((item) => (
-          <div className="queue-row" key={item.id}>
-            <button className="upvote" onClick={() => onVote(item.id)} aria-label={`Upvote ${item.user}'s idea`}>
-              ▲<span>{item.votes ?? 0}</span>
-            </button>
-            <FeedBubble item={item} />
-          </div>
-        ))}
+        {queue.length > 0 ? queue.map((item) => {
+          const voted = votedIds.has(item.id)
+          const pending = pendingVotes.has(item.id)
+          return (
+            <div className="queue-row" key={item.id}>
+              <button
+                className={`upvote ${voted ? 'voted' : ''}`}
+                onClick={() => onVote(item.id)}
+                aria-label={`${voted ? 'Voted for' : 'Upvote'} ${item.user}'s idea`}
+                aria-pressed={voted}
+                disabled={voted || pending}
+              >
+                {voted ? '✓' : '▲'}<span>{item.votes ?? 0}</span>
+              </button>
+              <FeedBubble item={item} />
+            </div>
+          )
+        }) : <div className="empty-feed">the queue is open</div>}
       </div>
     </div>
   )
@@ -135,21 +165,31 @@ function ChatPanel({
   activeTab,
   isDesktop,
   input,
+  submitting,
   onInput,
   onSubmit,
   onTab,
+  playingNext,
+  generatingNow,
   queue,
   onVote,
+  votedIds,
+  pendingVotes,
 }: {
   chat: FeedItem[]
   activeTab: 'chat' | 'queue'
   isDesktop: boolean
   input: string
+  submitting: boolean
   onInput: (value: string) => void
   onSubmit: (event: FormEvent) => void
   onTab: (tab: 'chat' | 'queue') => void
+  playingNext: FeedItem[]
+  generatingNow: FeedItem[]
   queue: FeedItem[]
   onVote: (id: number) => void
+  votedIds: Set<number>
+  pendingVotes: Set<number>
 }) {
   const messagesRef = useRef<HTMLDivElement>(null)
 
@@ -173,7 +213,9 @@ function ChatPanel({
       {activeTab === 'chat' || isDesktop ? (
         <div className="chat-tab-pane">
           <div className="chat-messages" data-testid="chat-messages" ref={messagesRef}>
-            {chat.map((item) => <FeedBubble key={item.id} item={item} className="chat-bubble" />)}
+            {chat.length > 0
+              ? chat.map((item) => <FeedBubble key={item.id} item={item} className="chat-bubble" />)
+              : <div className="empty-feed chat-empty">be the first to decide what airs</div>}
           </div>
           <form className="chat-form" onSubmit={onSubmit}>
             <input
@@ -183,12 +225,20 @@ function ChatPanel({
               maxLength={200}
               placeholder="What you wanna see next…"
               autoComplete="off"
+              disabled={submitting}
             />
-            <button type="submit">Say</button>
+            <button type="submit" disabled={submitting}>{submitting ? '…' : 'Say'}</button>
           </form>
         </div>
       ) : (
-        <QueuePanel queue={queue} onVote={onVote} />
+        <QueuePanel
+          playingNext={playingNext}
+          generatingNow={generatingNow}
+          queue={queue}
+          onVote={onVote}
+          votedIds={votedIds}
+          pendingVotes={pendingVotes}
+        />
       )}
     </aside>
   )
@@ -231,36 +281,73 @@ function Splash({ onTuneIn }: { onTuneIn: () => void }) {
   )
 }
 
+function noticeForError(error: unknown) {
+  if (error instanceof ChannelApiError) {
+    if (error.code === 'DUPLICATE_PROMPT') return 'that idea is already in the channel'
+    if (error.code === 'RATE_LIMITED') return 'slow down a little, then try again'
+    if (error.code === 'INVALID_STATE') return 'that item has already moved on'
+    return error.message
+  }
+  return 'the channel lost the request — please retry'
+}
+
 function App() {
   const isDesktop = useDeskQueue()
+  const { snapshot, connection, error: connectionError, refresh } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<'chat' | 'queue'>('chat')
   const [input, setInput] = useState('')
-  const [nickname, setNickname] = useState('')
+  const [nickname, setNickname] = useState(savedNickname)
   const [nameDraft, setNameDraft] = useState('')
   const [nameModal, setNameModal] = useState(false)
   const [pendingMessage, setPendingMessage] = useState('')
-  const [chat, setChat] = useState(initialChat)
-  const [queue, setQueue] = useState(initialQueue)
-  const [likes, setLikes] = useState(0)
+  const [submitting, setSubmitting] = useState(false)
+  const [votedIds, setVotedIds] = useState(savedVotes)
+  const [pendingVotes, setPendingVotes] = useState<Set<number>>(() => new Set())
   const [heartKeys, setHeartKeys] = useState<number[]>([])
+  const [notice, setNotice] = useState<string | null>(null)
+  const [failedVideoId, setFailedVideoId] = useState<number | null>(null)
+  const noticeTimer = useRef<number | null>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
 
-  const nowPlaying = useMemo(() => ({
-    time: '11:28',
-    user: 'teacupTV',
-    message: 'friendly robots host a tiny cosmic game show inside a teacup on the moon',
-  }), [])
+  const chat = useMemo(() => (snapshot?.chat ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.chat, nickname])
+  const playingNext = useMemo(() => (snapshot?.playingNext ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.playingNext, nickname])
+  const generatingNow = useMemo(() => (snapshot?.generatingNow ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.generatingNow, nickname])
+  const queue = useMemo(() => (snapshot?.queue ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.queue, nickname])
+  const nowPlaying = snapshot?.nowPlaying
 
-  function submitMessage(message: string, user: string) {
+  useEffect(() => {
+    setFailedVideoId(null)
+  }, [nowPlaying?.id, nowPlaying?.videoUrl])
+
+  useEffect(() => () => {
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current)
+  }, [])
+
+  function showNotice(message: string) {
+    setNotice(message)
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current)
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 3_400)
+  }
+
+  async function sendMessage(message: string, user: string) {
     const trimmed = message.trim()
-    if (!trimmed) return
-    const now = new Date()
-    const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
-    const item: FeedItem = { id: Date.now(), time, user, message: trimmed, votes: 0, mine: true }
-    setChat((items) => [...items, item])
-    setQueue((items) => [...items, item])
-    setInput('')
+    if (!trimmed || submitting) return
+    setSubmitting(true)
+    try {
+      const result = await submitPrompt(user, trimmed)
+      setInput('')
+      setPendingMessage('')
+      if (result.idea.status === 'pending_review') showNotice('sent to moderation — it will queue after approval')
+      else if (result.idea.status === 'rejected') showNotice('this prompt could not be accepted')
+      else showNotice('added to the live queue')
+      await refresh()
+    } catch (requestError) {
+      showNotice(noticeForError(requestError))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   function handleSubmit(event: FormEvent) {
@@ -271,28 +358,53 @@ function App() {
       setNameModal(true)
       return
     }
-    submitMessage(input, nickname)
+    void sendMessage(input, nickname)
   }
 
   function handleJoin(event: FormEvent) {
     event.preventDefault()
     const safeName = nameDraft.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 18)
     if (!safeName) return
+    window.localStorage.setItem('infinite-slop-nickname', safeName)
     setNickname(safeName)
     setNameModal(false)
-    submitMessage(pendingMessage, safeName)
-    setPendingMessage('')
+    void sendMessage(pendingMessage, safeName)
   }
 
-  function handleVote(id: number) {
-    setQueue((items) => items.map((item) => item.id === id ? { ...item, votes: (item.votes ?? 0) + 1 } : item))
+  async function handleVote(id: number) {
+    if (votedIds.has(id) || pendingVotes.has(id)) return
+    setPendingVotes((items) => new Set(items).add(id))
+    try {
+      await voteForIdea(id)
+      setVotedIds((items) => {
+        const next = new Set(items).add(id)
+        window.localStorage.setItem('infinite-slop-votes', JSON.stringify([...next]))
+        return next
+      })
+      await refresh()
+    } catch (requestError) {
+      if (requestError instanceof ChannelApiError && requestError.code === 'INVALID_STATE' && requestError.message === 'Already voted') {
+        setVotedIds((items) => new Set(items).add(id))
+      }
+      showNotice(noticeForError(requestError))
+    } finally {
+      setPendingVotes((items) => {
+        const next = new Set(items)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
-  function addHeart() {
+  async function addHeart() {
     const key = Date.now()
-    setLikes((count) => count + 1)
     setHeartKeys((keys) => [...keys, key])
-    window.setTimeout(() => setHeartKeys((keys) => keys.filter((item) => item !== key)), 2700)
+    window.setTimeout(() => setHeartKeys((keys) => keys.filter((item) => item !== key)), 2_700)
+    try {
+      await likeChannel()
+    } catch (requestError) {
+      showNotice(noticeForError(requestError))
+    }
   }
 
   function handleTab(tab: 'chat' | 'queue') {
@@ -303,20 +415,55 @@ function App() {
     setActiveTab(tab)
   }
 
+  function tuneIn() {
+    setTunedIn(true)
+    if (videoRef.current) {
+      videoRef.current.muted = false
+      void videoRef.current.play().catch(() => undefined)
+    }
+  }
+
+  const statusNotice = notice || connectionError
+  const nowMessage = nowPlaying?.message || 'the next broadcast is warming up'
+  const nowUser = nowPlaying?.user || 'channel'
+  const nowTime = nowPlaying?.time || '--:--'
+  const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
+  const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
+
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
       <div className={`tv-wrap ${tunedIn ? 'playing' : ''}`}>
-        <img className="video-frame" src="/assets/tv-frame.png" alt="Surreal AI-generated television broadcast" />
+        <img className="video-frame video-poster" src={poster} alt="Surreal AI-generated television broadcast" />
+        {showVideo ? (
+          <video
+            key={`${nowPlaying?.id}:${nowPlaying?.videoUrl}`}
+            ref={videoRef}
+            className="video-frame broadcast-video"
+            src={nowPlaying?.videoUrl || undefined}
+            poster={poster}
+            autoPlay
+            muted={!tunedIn}
+            playsInline
+            loop
+            preload="auto"
+            onError={() => setFailedVideoId(nowPlaying?.id ?? null)}
+            onEnded={() => window.setTimeout(() => void refresh(), 250)}
+          />
+        ) : null}
       </div>
 
-      {tunedIn ? <div className="live-pill"><span />LIVE</div> : null}
+      {tunedIn ? (
+        <div className={`live-pill ${connection !== 'live' ? 'syncing' : ''}`}>
+          <span />{connection === 'live' ? 'LIVE' : 'SYNCING'}
+        </div>
+      ) : null}
 
       <div className="top-left">
         <div className="now-playing">
           <span className="now-label">PLAYING</span>
-          <span className="now-message"><span className="time">{nowPlaying.time}</span><b>{nowPlaying.user}:</b> {nowPlaying.message}</span>
+          <span className="now-message"><span className="time">{nowTime}</span><b>{nowUser}:</b> {nowMessage}</span>
         </div>
-        <div className="viewer-pill">👀 <b>753</b> watching</div>
+        <div className="viewer-pill">👀 <b>{snapshot?.live.viewers ?? 0}</b> watching</div>
       </div>
 
       <button className="chat-toggle" onClick={() => setChatOpen((open) => !open)}>
@@ -325,7 +472,14 @@ function App() {
 
       {isDesktop && chatOpen ? (
         <aside className="left-queue">
-          <QueuePanel queue={queue} onVote={handleVote} />
+          <QueuePanel
+            playingNext={playingNext}
+            generatingNow={generatingNow}
+            queue={queue}
+            onVote={(id) => void handleVote(id)}
+            votedIds={votedIds}
+            pendingVotes={pendingVotes}
+          />
         </aside>
       ) : null}
 
@@ -335,24 +489,30 @@ function App() {
           activeTab={activeTab}
           isDesktop={isDesktop}
           input={input}
+          submitting={submitting}
           onInput={setInput}
           onSubmit={handleSubmit}
           onTab={handleTab}
+          playingNext={playingNext}
+          generatingNow={generatingNow}
           queue={queue}
-          onVote={handleVote}
+          onVote={(id) => void handleVote(id)}
+          votedIds={votedIds}
+          pendingVotes={pendingVotes}
         />
       ) : null}
 
       <div className="credit"><BrandCredit /></div>
 
       {!chatOpen ? (
-        <button className="heart-button" onClick={addHeart}>❤️<span>{likes}</span></button>
+        <button className="heart-button" onClick={() => void addHeart()}>❤️<span>{snapshot?.live.likes ?? 0}</span></button>
       ) : null}
       {heartKeys.map((key, index) => (
         <span className="floating-heart" key={key} style={{ '--heart-x': `${14 + (index % 3) * 18}px`, '--wobble': `${index % 2 ? 30 : -24}px` } as React.CSSProperties}>❤️</span>
       ))}
 
-      {!tunedIn ? <Splash onTuneIn={() => setTunedIn(true)} /> : null}
+      {statusNotice ? <div className="action-notice" role="status">{statusNotice}</div> : null}
+      {!tunedIn ? <Splash onTuneIn={tuneIn} /> : null}
 
       {nameModal ? (
         <>
@@ -367,8 +527,9 @@ function App() {
                 maxLength={18}
                 placeholder="your name…"
                 aria-label="Your chat name"
+                disabled={submitting}
               />
-              <button type="submit">Join</button>
+              <button type="submit" disabled={submitting}>Join</button>
             </form>
           </section>
         </>
