@@ -186,10 +186,16 @@ function configuredGenerationDuration(env: WorkerEnv) {
   return boundedEnvNumber(env.ORANGE_DURATION_SECONDS, 10, 1, 15)
 }
 
+function channelBotGrokEnabled(env: WorkerEnv) {
+  return (env.CHANNEL_BOT_GROK_ENABLED as string) === 'true'
+}
+
 function modelForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_model'>) {
   if (idea.requested_model) return idea.requested_model
   if (idea.author === channelBotAuthor) {
-    return Number(idea.id) % 2 === 0 ? 'wan2.7-t2v' : 'grok-imagine-video'
+    return channelBotGrokEnabled(env) && Number(idea.id) % 2 !== 0
+      ? 'grok-imagine-video'
+      : 'wan2.7-t2v'
   }
   return env.ORANGE_MODEL as string
 }
