@@ -1,4 +1,4 @@
-import { FormEvent, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChannelApiError,
   type ChannelIdea,
@@ -325,7 +325,7 @@ function noticeForError(error: unknown) {
 
 function App() {
   const isDesktop = useDeskQueue()
-  const { snapshot, error: connectionError, refresh } = useChannel()
+  const { snapshot, error: connectionError, refresh, applyLikes } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<'chat' | 'queue'>('chat')
@@ -347,6 +347,8 @@ function App() {
   const noticeTimer = useRef<number | null>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const chatHistoryExhausted = useRef(false)
+  const endedPlaybackKey = useRef<string | null>(null)
+  const playbackRetryTimers = useRef<number[]>([])
 
   const chatIdeas = useMemo(() => {
     const latest = snapshot?.chat ?? []
@@ -360,6 +362,7 @@ function App() {
   const generatingNow = useMemo(() => (snapshot?.generatingNow ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.generatingNow, nickname])
   const queue = useMemo(() => (snapshot?.queue ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.queue, nickname])
   const nowPlaying = snapshot?.nowPlaying
+  const nowPlayingKey = nowPlaying ? `${nowPlaying.id}:${nowPlaying.startedAt ?? 'pending'}` : null
   const preloadedVideo = snapshot?.playingNext.find((idea) => (
     Boolean(idea.videoUrl) && idea.id !== nowPlaying?.id
   ))
@@ -375,6 +378,20 @@ function App() {
   useEffect(() => {
     setFailedVideoId(null)
   }, [nowPlaying?.id, nowPlaying?.videoUrl, nowPlaying?.startedAt])
+
+  const clearPlaybackRetries = useCallback(() => {
+    for (const timer of playbackRetryTimers.current) window.clearTimeout(timer)
+    playbackRetryTimers.current = []
+  }, [])
+
+  useEffect(() => () => clearPlaybackRetries(), [clearPlaybackRetries])
+
+  useEffect(() => {
+    if (endedPlaybackKey.current !== null && endedPlaybackKey.current !== nowPlayingKey) {
+      endedPlaybackKey.current = null
+      clearPlaybackRetries()
+    }
+  }, [clearPlaybackRetries, nowPlayingKey])
 
   useEffect(() => {
     if (failedVideoId === null) return
@@ -483,7 +500,9 @@ function App() {
     setHeartKeys((keys) => [...keys, key])
     window.setTimeout(() => setHeartKeys((keys) => keys.filter((item) => item !== key)), 2_700)
     try {
-      await likeChannel()
+      const result = await likeChannel()
+      applyLikes(result.likes, result.revision)
+      void refresh()
     } catch (requestError) {
       showNotice(noticeForError(requestError))
     }
@@ -512,6 +531,21 @@ function App() {
   const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
   const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
 
+  const handleVideoEnded = useCallback(() => {
+    if (!nowPlayingKey || endedPlaybackKey.current === nowPlayingKey) return
+
+    endedPlaybackKey.current = nowPlayingKey
+    clearPlaybackRetries()
+    const requestNext = () => {
+      if (endedPlaybackKey.current === nowPlayingKey) void refresh()
+    }
+
+    requestNext()
+    for (const delay of [500, 1_200, 2_400, 4_000]) {
+      playbackRetryTimers.current.push(window.setTimeout(requestNext, delay))
+    }
+  }, [clearPlaybackRetries, nowPlayingKey, refresh])
+
   useEffect(() => {
     const video = videoRef.current
     if (!video || !showVideo) return
@@ -527,7 +561,7 @@ function App() {
       video.removeEventListener('canplay', startPlayback)
       window.clearTimeout(timer)
     }
-  }, [nowPlaying?.id, nowPlaying?.videoUrl, showVideo, tunedIn])
+  }, [nowPlaying?.id, nowPlaying?.startedAt, nowPlaying?.videoUrl, showVideo, tunedIn])
 
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
@@ -535,7 +569,7 @@ function App() {
         <img className="video-frame video-poster" src={poster} alt="Surreal AI-generated television broadcast" />
         {showVideo ? (
           <video
-            key={`${nowPlaying?.id}:${nowPlaying?.videoUrl}`}
+            key={`${nowPlaying?.id}:${nowPlaying?.startedAt}:${nowPlaying?.videoUrl}`}
             ref={videoRef}
             className="video-frame broadcast-video"
             src={nowPlaying?.videoUrl || undefined}
@@ -548,7 +582,7 @@ function App() {
               setFailedVideoId(nowPlaying?.id ?? null)
               void refresh()
             }}
-            onEnded={() => void refresh()}
+            onEnded={handleVideoEnded}
           />
         ) : null}
         {preloadedVideo?.videoUrl ? (

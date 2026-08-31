@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS votes (
 CREATE TABLE IF NOT EXISTS channel_state (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
   revision INTEGER NOT NULL DEFAULT 0,
-  likes INTEGER NOT NULL DEFAULT 0,
+  likes INTEGER NOT NULL DEFAULT 9000,
   is_live INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL
 );
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS generation_budget (
 );
 
 INSERT OR IGNORE INTO channel_state(singleton, revision, likes, is_live, updated_at)
-VALUES (1, 0, 0, 1, unixepoch('subsec') * 1000);
+VALUES (1, 0, 9000, 1, unixepoch('subsec') * 1000);
 
 CREATE INDEX IF NOT EXISTS ideas_stage_order
   ON ideas(status, status_changed_at, created_at, id);

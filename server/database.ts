@@ -237,7 +237,7 @@ export class ChannelDatabase {
       this.db.prepare(`
         INSERT OR IGNORE INTO channel_state(
           singleton, revision, likes, viewers, is_live, provider, updated_at
-        ) VALUES (1, 0, 0, 1, 1, ?, ?)
+        ) VALUES (1, 0, 9000, 1, 1, ?, ?)
       `).run(provider, now)
       this.db.exec('COMMIT')
     } catch (error) {

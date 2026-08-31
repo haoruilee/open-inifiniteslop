@@ -154,6 +154,19 @@ export function useChannel() {
     }
   }, [applySnapshot])
 
+  const applyLikes = useCallback((likes: number, revision: number) => {
+    if (!Number.isSafeInteger(likes) || likes < 0 || !Number.isSafeInteger(revision)) return
+    latestRevision.current = Math.max(latestRevision.current, revision)
+    setSnapshot((current) => {
+      if (!current || revision < current.revision) return current
+      return {
+        ...current,
+        revision: Math.max(current.revision, revision),
+        live: { ...current.live, likes },
+      }
+    })
+  }, [])
+
   useEffect(() => {
     const controller = new AbortController()
     let timer: number | null = null
@@ -176,5 +189,5 @@ export function useChannel() {
     }
   }, [refresh])
 
-  return { snapshot, connection, error, refresh }
+  return { snapshot, connection, error, refresh, applyLikes }
 }

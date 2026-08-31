@@ -185,7 +185,7 @@ test('makes votes atomic per visitor and likes exact', async () => {
 
     const likes = await Promise.all(Array.from({ length: 20 }, () => server.jsonRequest('/api/likes', {})))
     assert.equal(likes.every((response) => response.status === 200), true)
-    assert.equal((await (await server.request('/api/state')).json() as ChannelSnapshot).live.likes, 20)
+    assert.equal((await (await server.request('/api/state')).json() as ChannelSnapshot).live.likes, 9020)
   } finally {
     await server.close()
   }
@@ -211,7 +211,7 @@ test('enforces independent mutation rate limits and same-origin writes', async (
       headers: { Origin: 'https://attacker.invalid', 'Sec-Fetch-Site': 'cross-site' },
     })
     assert.equal(crossSite.status, 403)
-    assert.equal((await (await server.request('/api/state')).json() as ChannelSnapshot).live.likes, 1)
+    assert.equal((await (await server.request('/api/state')).json() as ChannelSnapshot).live.likes, 9001)
   } finally {
     await server.close()
   }
