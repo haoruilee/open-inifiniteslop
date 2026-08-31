@@ -226,7 +226,7 @@ function App() {
   const nowPlaying = useMemo(() => ({
     time: '11:28',
     user: 'teacupTV',
-    message: 'a tiny cosmic game show inside a teacup',
+    message: 'friendly robots host a tiny cosmic game show inside a teacup on the moon',
   }), [])
 
   function submitMessage(message: string, user: string) {
