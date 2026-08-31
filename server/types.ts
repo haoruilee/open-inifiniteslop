@@ -38,6 +38,8 @@ export type IdeaRecord = {
   generationProgress: string | null
   error: string | null
   playCount: number
+  generationAttempts: number
+  retryAt: number | null
 }
 
 export type PublicIdea = {
@@ -52,6 +54,7 @@ export type PublicIdea = {
   posterUrl: string | null
   durationSeconds: number | null
   generationProgress: string | null
+  startedAt: number | null
 }
 
 export type ChannelSnapshot = {

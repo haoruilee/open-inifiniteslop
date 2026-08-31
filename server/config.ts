@@ -5,10 +5,19 @@ export type RuntimeConfig = {
   port: number
   databasePath: string
   staticDir: string
+  mediaDir: string
   adminToken: string | null
   secureCookies: boolean
   trustProxy: boolean
   provider: 'mock' | 'fal'
+  falKey: string | null
+  falModel: string
+  generationConcurrency: number
+  bufferTarget: number
+  workerIntervalMs: number
+  rotationIntervalMs: number
+  mockGenerationDelayMs: number
+  providerTimeoutMs: number
   promptRateLimit: number
   voteRateLimit: number
   likeRateLimit: number
@@ -37,10 +46,19 @@ export function loadConfig(
     port: integerValue(environment.PORT, 8787, 1, 65_535),
     databasePath: resolve(workingDirectory, environment.DATABASE_PATH || 'data/channel.sqlite'),
     staticDir: resolve(workingDirectory, environment.STATIC_DIR || 'dist'),
+    mediaDir: resolve(workingDirectory, environment.MEDIA_DIR || 'data/videos'),
     adminToken: environment.ADMIN_TOKEN?.trim() || null,
     secureCookies: booleanValue(environment.SECURE_COOKIES, environment.NODE_ENV === 'production'),
     trustProxy: booleanValue(environment.TRUST_PROXY, false),
     provider,
+    falKey: environment.FAL_KEY?.trim() || null,
+    falModel: environment.FAL_MODEL?.trim() || 'minimax/h3-max/text-to-video',
+    generationConcurrency: integerValue(environment.GENERATION_CONCURRENCY, 1, 1, 4),
+    bufferTarget: integerValue(environment.BUFFER_TARGET, 4, 1, 20),
+    workerIntervalMs: integerValue(environment.WORKER_INTERVAL_MS, 750, 100, 60_000),
+    rotationIntervalMs: integerValue(environment.ROTATION_INTERVAL_MS, 500, 100, 10_000),
+    mockGenerationDelayMs: integerValue(environment.MOCK_GENERATION_DELAY_MS, 800, 0, 60_000),
+    providerTimeoutMs: integerValue(environment.PROVIDER_TIMEOUT_MS, 900_000, 10_000, 3_600_000),
     promptRateLimit: integerValue(environment.PROMPT_RATE_LIMIT, 5, 1, 10_000),
     voteRateLimit: integerValue(environment.VOTE_RATE_LIMIT, 30, 1, 10_000),
     likeRateLimit: integerValue(environment.LIKE_RATE_LIMIT, 30, 1, 10_000),

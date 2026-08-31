@@ -1,5 +1,7 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { createReadStream, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { extname, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import type { RuntimeConfig } from './config.js'
 import {
@@ -92,6 +94,70 @@ function apiError(response: ServerResponse, error: HttpError) {
       ...(error.fields ? { fields: error.fields } : {}),
     },
   })
+}
+
+function serveMedia(
+  request: IncomingMessage,
+  response: ServerResponse,
+  database: ChannelDatabase,
+  mediaRoot: string,
+  ideaId: number,
+) {
+  const idea = database.getIdea(ideaId)
+  if (!idea.videoPath) throw new NotFoundError('Video not found')
+  const absoluteRoot = `${resolve(mediaRoot)}${sep}`
+  const absolutePath = resolve(idea.videoPath)
+  if (!absolutePath.startsWith(absoluteRoot)) throw new NotFoundError('Video not found')
+
+  let stats
+  try {
+    stats = statSync(absolutePath)
+  } catch {
+    throw new NotFoundError('Video not found')
+  }
+  if (!stats.isFile()) throw new NotFoundError('Video not found')
+
+  const mimeType = extname(absolutePath).toLocaleLowerCase('en') === '.webm' ? 'video/webm' : 'video/mp4'
+  const range = request.headers.range
+  let start = 0
+  let end = stats.size - 1
+  if (range) {
+    const match = range.match(/^bytes=(\d*)-(\d*)$/u)
+    if (!match || (!match[1] && !match[2])) {
+      response.statusCode = 416
+      response.setHeader('Content-Range', `bytes */${stats.size}`)
+      response.end()
+      return
+    }
+    if (!match[1]) {
+      const suffix = Number.parseInt(match[2], 10)
+      start = Math.max(0, stats.size - suffix)
+    } else {
+      start = Number.parseInt(match[1], 10)
+    }
+    if (match[2]) end = Math.min(stats.size - 1, Number.parseInt(match[2], 10))
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start > end || start >= stats.size) {
+      response.statusCode = 416
+      response.setHeader('Content-Range', `bytes */${stats.size}`)
+      response.end()
+      return
+    }
+    response.statusCode = 206
+    response.setHeader('Content-Range', `bytes ${start}-${end}/${stats.size}`)
+  } else {
+    response.statusCode = 200
+  }
+  response.setHeader('Content-Type', mimeType)
+  response.setHeader('Accept-Ranges', 'bytes')
+  response.setHeader('Cache-Control', 'public, max-age=86400, immutable')
+  response.setHeader('Content-Length', String(end - start + 1))
+  if (request.method === 'HEAD') {
+    response.end()
+    return
+  }
+  const stream = createReadStream(absolutePath, { start, end })
+  stream.once('error', () => response.destroy())
+  stream.pipe(response)
 }
 
 async function readJson(request: IncomingMessage, maxBytes = 4_096): Promise<unknown> {
@@ -288,6 +354,12 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
         if (result.allowed) return
         response.setHeader('Retry-After', String(result.retryAfterSeconds))
         throw new HttpError(429, 'RATE_LIMITED', 'Too many requests; try again shortly')
+      }
+
+      const mediaMatch = pathname.match(/^\/api\/media\/(\d+)$/u)
+      if ((method === 'GET' || method === 'HEAD') && mediaMatch) {
+        serveMedia(request, response, database, config.mediaDir, Number(mediaMatch[1]))
+        return
       }
 
       if (method === 'GET' && pathname === '/api/health') {

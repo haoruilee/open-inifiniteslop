@@ -32,6 +32,8 @@ type IdeaRow = {
   generation_progress: string | null
   error: string | null
   play_count: number
+  generation_attempts: number
+  retry_at: number | null
 }
 
 type ChannelRow = {
@@ -78,7 +80,9 @@ const schema = `
     duration_seconds REAL,
     generation_progress TEXT,
     error TEXT,
-    play_count INTEGER NOT NULL DEFAULT 0
+    play_count INTEGER NOT NULL DEFAULT 0,
+    generation_attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at INTEGER
   );
 
   CREATE TABLE IF NOT EXISTS chat_messages (
@@ -141,6 +145,8 @@ function mapIdea(row: IdeaRow): IdeaRecord {
     generationProgress: row.generation_progress,
     error: row.error,
     playCount: Number(row.play_count),
+    generationAttempts: Number(row.generation_attempts),
+    retryAt: row.retry_at === null ? null : Number(row.retry_at),
   }
 }
 
@@ -149,7 +155,6 @@ function formatClock(timestamp: number) {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
-    timeZone: 'UTC',
   }).format(new Date(timestamp))
 }
 
@@ -166,6 +171,7 @@ function toPublicIdea(idea: IdeaRecord): PublicIdea {
     posterUrl: idea.posterUrl,
     durationSeconds: idea.durationSeconds,
     generationProgress: idea.generationProgress,
+    startedAt: idea.status === 'playing' ? idea.statusChangedAt : null,
   }
 }
 
@@ -215,6 +221,16 @@ export class ChannelDatabase {
     try {
       this.db.prepare(`
         INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)
+      `).run(now)
+      const columns = this.db.prepare('PRAGMA table_info(ideas)').all() as Array<{ name: string }>
+      if (!columns.some((column) => column.name === 'generation_attempts')) {
+        this.db.exec('ALTER TABLE ideas ADD COLUMN generation_attempts INTEGER NOT NULL DEFAULT 0')
+      }
+      if (!columns.some((column) => column.name === 'retry_at')) {
+        this.db.exec('ALTER TABLE ideas ADD COLUMN retry_at INTEGER')
+      }
+      this.db.prepare(`
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)
       `).run(now)
       this.db.prepare(`
         INSERT OR IGNORE INTO channel_state(
@@ -411,6 +427,195 @@ export class ChannelDatabase {
       LIMIT 100
     `).all(status) as IdeaRow[]
     return rows.map(mapIdea)
+  }
+
+  requeueInterruptedGeneration() {
+    const now = this.now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE ideas
+        SET status = 'queued', status_changed_at = ?, generation_progress = 'recovered_after_restart',
+            error = NULL, retry_at = NULL
+        WHERE status = 'generating'
+      `).run(now)
+      const changed = Number(result.changes) > 0
+      const revision = changed ? this.bumpRevision(now) : this.getRevision()
+      this.db.exec('COMMIT')
+      return { changed, revision }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  pipelineCounts() {
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM ideas
+      WHERE status IN ('generating', 'ready', 'playing')
+      GROUP BY status
+    `).all() as Array<{ status: 'generating' | 'ready' | 'playing'; count: number }>
+    const result = { generating: 0, ready: 0, playing: 0 }
+    for (const row of rows) result[row.status] = Number(row.count)
+    return result
+  }
+
+  claimNextForGeneration(provider: string) {
+    const now = this.now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.db.prepare(`${publicStatusSql}
+        WHERE i.status = 'queued' AND (i.retry_at IS NULL OR i.retry_at <= ?)
+        GROUP BY i.id
+        ORDER BY votes DESC, i.created_at ASC, i.id ASC
+        LIMIT 1
+      `).get(now) as IdeaRow | undefined
+      if (!row) {
+        this.db.exec('COMMIT')
+        return null
+      }
+      this.db.prepare(`
+        UPDATE ideas
+        SET status = 'generating', status_changed_at = ?, provider = ?,
+            generation_progress = 'starting', error = NULL, retry_at = NULL,
+            generation_attempts = generation_attempts + 1
+        WHERE id = ? AND status = 'queued'
+      `).run(now, provider, row.id)
+      this.bumpRevision(now)
+      this.db.exec('COMMIT')
+      return this.getIdea(row.id)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  updateGenerationProgress(ideaId: number, progress: string, requestId?: string) {
+    const now = this.now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE ideas
+        SET generation_progress = ?, provider_request_id = COALESCE(?, provider_request_id),
+            status_changed_at = status_changed_at
+        WHERE id = ? AND status = 'generating'
+      `).run(progress.slice(0, 160), requestId ?? null, ideaId)
+      const changed = Number(result.changes) > 0
+      const revision = changed ? this.bumpRevision(now) : this.getRevision()
+      this.db.exec('COMMIT')
+      return { changed, revision }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  completeGeneration(ideaId: number, media: {
+    videoUrl: string | null
+    videoPath: string | null
+    posterUrl: string | null
+    durationSeconds: number
+    providerRequestId: string | null
+  }) {
+    const now = this.now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE ideas
+        SET status = 'ready', status_changed_at = ?, video_url = ?, video_path = ?,
+            poster_url = ?, duration_seconds = ?, provider_request_id = COALESCE(?, provider_request_id),
+            generation_progress = 'complete', error = NULL, retry_at = NULL
+        WHERE id = ? AND status = 'generating'
+      `).run(
+        now,
+        media.videoUrl,
+        media.videoPath,
+        media.posterUrl,
+        media.durationSeconds,
+        media.providerRequestId,
+        ideaId,
+      )
+      if (Number(result.changes) === 0) throw new InvalidStateError('Idea is not generating')
+      const revision = this.bumpRevision(now)
+      this.db.exec('COMMIT')
+      return { idea: this.getIdea(ideaId), revision }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  failGeneration(ideaId: number, message: string, retryDelayMs: number | null) {
+    const now = this.now()
+    const nextStatus: IdeaStatus = retryDelayMs === null ? 'failed' : 'queued'
+    const retryAt = retryDelayMs === null ? null : now + retryDelayMs
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db.prepare(`
+        UPDATE ideas
+        SET status = ?, status_changed_at = ?, generation_progress = ?, error = ?, retry_at = ?
+        WHERE id = ? AND status = 'generating'
+      `).run(
+        nextStatus,
+        now,
+        retryDelayMs === null ? 'failed' : 'retry_scheduled',
+        message.slice(0, 240),
+        retryAt,
+        ideaId,
+      )
+      if (Number(result.changes) === 0) return { changed: false, revision: this.getRevision() }
+      const revision = this.bumpRevision(now)
+      this.db.exec('COMMIT')
+      return { changed: true, revision }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  advancePlayback() {
+    const now = this.now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      let changed = false
+      const current = this.db.prepare(`
+        SELECT id, status_changed_at, COALESCE(duration_seconds, 10) AS duration_seconds
+        FROM ideas WHERE status = 'playing'
+        ORDER BY status_changed_at ASC, id ASC LIMIT 1
+      `).get() as { id: number; status_changed_at: number; duration_seconds: number } | undefined
+
+      let needsNext = !current
+      if (current && now - Number(current.status_changed_at) >= Number(current.duration_seconds) * 1_000) {
+        this.db.prepare(`
+          UPDATE ideas SET status = 'aired', status_changed_at = ? WHERE id = ? AND status = 'playing'
+        `).run(now, current.id)
+        changed = true
+        needsNext = true
+      }
+
+      if (needsNext) {
+        const next = this.db.prepare(`
+          SELECT id FROM ideas WHERE status = 'ready'
+          ORDER BY status_changed_at ASC, id ASC LIMIT 1
+        `).get() as { id: number } | undefined
+        if (next) {
+          this.db.prepare(`
+            UPDATE ideas
+            SET status = 'playing', status_changed_at = ?, play_count = play_count + 1
+            WHERE id = ? AND status = 'ready'
+          `).run(now, next.id)
+          changed = true
+        }
+      }
+
+      const revision = changed ? this.bumpRevision(now) : this.getRevision()
+      this.db.exec('COMMIT')
+      return { changed, revision }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   private listByStatus(status: IdeaStatus, limit: number, orderBy: string) {

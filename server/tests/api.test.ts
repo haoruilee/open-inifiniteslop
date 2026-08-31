@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -44,6 +44,7 @@ async function startTestServer(overrides: NodeJS.ProcessEnv = {}) {
 
   return {
     app,
+    config,
     database,
     origin,
     request,
@@ -292,6 +293,47 @@ test('streams an initial SSE snapshot and the next mutation revision', async () 
     await reader.cancel().catch(() => undefined)
   } finally {
     controller.abort()
+    await server.close()
+  }
+})
+
+test('serves provider-downloaded media with immutable byte ranges', async () => {
+  const server = await startTestServer()
+  try {
+    const created = server.database.createSubmission(
+      'media-visitor',
+      'media',
+      'a harmless media route test',
+      { decision: 'approve', reason: null },
+    ).idea
+    server.database.claimNextForGeneration('fal')
+    mkdirSync(server.config.mediaDir, { recursive: true })
+    const mediaPath = join(server.config.mediaDir, `${created.id}.mp4`)
+    const bytes = Buffer.from('00000000000000000000mock-video-payload')
+    writeFileSync(mediaPath, bytes)
+    server.database.completeGeneration(created.id, {
+      videoUrl: `/api/media/${created.id}`,
+      videoPath: mediaPath,
+      posterUrl: null,
+      durationSeconds: 5,
+      providerRequestId: 'media-test',
+    })
+
+    const full = await server.request(`/api/media/${created.id}`)
+    assert.equal(full.status, 200)
+    assert.equal(full.headers.get('content-type'), 'video/mp4')
+    assert.equal(full.headers.get('accept-ranges'), 'bytes')
+    assert.equal(full.headers.get('cache-control'), 'public, max-age=86400, immutable')
+    assert.deepEqual(Buffer.from(await full.arrayBuffer()), bytes)
+
+    const partial = await server.request(`/api/media/${created.id}`, { headers: { Range: 'bytes=4-11' } })
+    assert.equal(partial.status, 206)
+    assert.equal(partial.headers.get('content-range'), `bytes 4-11/${bytes.length}`)
+    assert.deepEqual(Buffer.from(await partial.arrayBuffer()), bytes.subarray(4, 12))
+
+    const unsatisfiable = await server.request(`/api/media/${created.id}`, { headers: { Range: 'bytes=999-' } })
+    assert.equal(unsatisfiable.status, 416)
+  } finally {
     await server.close()
   }
 })
