@@ -5,17 +5,25 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
+    "build:client": "tsc --noEmit && vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build": "pnpm build:client && pnpm build:server",
+    "test": "tsx --test server/tests/*.test.ts",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
+    "@fal-ai/client": "^1.10.1",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
+    "@types/node": "^26.4.0",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.2",
+    "concurrently": "^10.0.5",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.2",
     "vite": "^7.1.3"
   }
