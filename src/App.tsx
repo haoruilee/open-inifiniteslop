@@ -17,6 +17,7 @@ type FeedItem = {
   votes?: number
   generating?: boolean
   mine?: boolean
+  automated?: boolean
 }
 
 function toFeedItem(idea: ChannelIdea, nickname: string): FeedItem {
@@ -28,6 +29,7 @@ function toFeedItem(idea: ChannelIdea, nickname: string): FeedItem {
     votes: idea.votes,
     generating: idea.status === 'generating',
     mine: nickname.length > 0 && idea.user === nickname,
+    automated: idea.user === 'channel bot',
   }
 }
 
@@ -71,25 +73,17 @@ function savedVotes() {
   }
 }
 
-const FalMark = memo(function FalMark() {
-  return (
-    <span className="fal-mark" aria-label="fal.ai">
-      <svg viewBox="0 0 32 32" aria-hidden="true">
-        <path d="M16 1.5c1.35 0 2.45 1.1 2.58 2.44A9.64 9.64 0 0 0 28.06 13.4 2.6 2.6 0 0 1 30.5 16a2.6 2.6 0 0 1-2.44 2.6 9.64 9.64 0 0 0-9.48 9.46A2.6 2.6 0 0 1 16 30.5a2.6 2.6 0 0 1-2.58-2.44 9.64 9.64 0 0 0-9.48-9.46A2.6 2.6 0 0 1 1.5 16a2.6 2.6 0 0 1 2.44-2.6 9.64 9.64 0 0 0 9.48-9.46A2.6 2.6 0 0 1 16 1.5Zm0 8.9a5.6 5.6 0 1 0 0 11.2 5.6 5.6 0 0 0 0-11.2Z" />
-      </svg>
-      <span>fal</span>
-    </span>
-  )
-})
-
 const BrandCredit = memo(function BrandCredit({ compact = false }: { compact?: boolean }) {
   return (
     <span className={compact ? 'brand-credit compact' : 'brand-credit'}>
       by{' '}
-      <a href="https://x.com/levelsio" target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
-        @levelsio
-      </a>{' '}
-      + <a href="https://fal.ai/minimax-h3-max" target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}><FalMark /></a>
+      <a href="https://x.com/AI4Azure" target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+        @AI4Azure
+      </a>
+      <span className="credit-divider" aria-hidden="true">·</span>
+      <a href="https://github.com/haoruilee/open-inifiniteslop" target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+        opensourced at GitHub
+      </a>
     </span>
   )
 })
@@ -97,10 +91,11 @@ const BrandCredit = memo(function BrandCredit({ compact = false }: { compact?: b
 const FeedBubble = memo(function FeedBubble({ item, className = '' }: { item: FeedItem; className?: string }) {
   return (
     <div
-      className={`feed-bubble ${item.generating ? 'generating' : ''} ${item.mine ? 'hot' : ''} ${className}`}
-      style={!item.generating && !item.mine ? { background: pastel(item.user) } : undefined}
+      className={`feed-bubble ${item.generating ? 'generating' : ''} ${item.mine ? 'hot' : ''} ${item.automated ? 'automated' : ''} ${className}`}
+      style={!item.generating && !item.mine && !item.automated ? { background: pastel(item.user) } : undefined}
     >
       <span className="time">{item.time}</span>
+      {item.automated ? <span className="automation-badge" aria-label="Automated channel bot">AUTO</span> : null}
       <b>{item.user}</b>
       {item.message}
     </div>
@@ -303,7 +298,10 @@ function Splash({ onTuneIn }: { onTuneIn: () => void }) {
       aria-label="Tune in to Infinite Slop"
     >
       <span className="splash-inner">
-        <span className="logo">Infinite Slop</span>
+        <span className="logo-lockup">
+          <img className="creator-avatar" src="/assets/ai4azure-avatar.png" alt="AI4Azure GitHub avatar" />
+          <span className="logo">Infinite Slop</span>
+        </span>
         <PlayIcon />
         <span className="subtitle">
           an endless AI-generated TV channel.<br />

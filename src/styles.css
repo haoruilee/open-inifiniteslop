@@ -150,6 +150,27 @@ a:focus-visible,
     6px 6px 0 #000;
 }
 
+.logo-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+
+.logo-lockup .logo {
+  margin-bottom: 0;
+}
+
+.creator-avatar {
+  width: clamp(52px, 8vw, 68px);
+  height: clamp(52px, 8vw, 68px);
+  flex: 0 0 auto;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: 4px 4px 0 #000;
+}
+
 .play-icon {
   width: 64px;
   height: 64px;
@@ -170,9 +191,9 @@ a:focus-visible,
 .brand-credit {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   color: #111;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -195,16 +216,8 @@ a:focus-visible,
   color: #ff90e8;
 }
 
-.fal-mark {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.fal-mark svg {
-  width: .95em;
-  height: .95em;
-  fill: currentColor;
+.credit-divider {
+  opacity: .58;
 }
 
 .chat-toggle,
@@ -374,6 +387,24 @@ a:focus-visible,
 
 .feed-bubble.generating {
   background: rgba(255, 233, 144, .85);
+}
+
+.feed-bubble.automated {
+  background: #cbeeff;
+}
+
+.automation-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: #075985;
+  font-size: .64em;
+  font-weight: 800;
+  letter-spacing: .08em;
+  line-height: 1.15;
+  vertical-align: .08em;
 }
 
 .feed-bubble.hot {
@@ -734,6 +765,10 @@ a:focus-visible,
 
   .heart-button {
     bottom: 14px;
+  }
+
+  .logo-lockup {
+    gap: 9px;
   }
 }
 

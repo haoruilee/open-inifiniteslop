@@ -1,5 +1,10 @@
 # Infinite Slop
 
+> **License — non-commercial only.** This repository is source-available under
+> the [AI4Azure Non-Commercial Source-Available License](./LICENSE). Any
+> commercial use requires prior written authorization from AI4Azure. It is not
+> offered under an OSI-approved open-source license.
+
 A full-stack recreation of the `infiniteslop.ai` experience: people submit prompts continuously, moderation decides what may enter the queue, a bounded worker generates vertical videos, and the server keeps an always-refilled live rotation. Chat, votes, likes, moderation decisions, generation progress, and playback history persist in SQLite.
 
 The replica never calls the original site's write APIs.

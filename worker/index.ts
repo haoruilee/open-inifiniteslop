@@ -103,8 +103,21 @@ const defaultArchiveLimit = 160
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
+const defaultChannelBotIntervalMinutes = 60
 const maximumPolls = 60
 const staleGenerationMs = 30 * 60_000
+const channelBotVisitorId = 'channel-bot'
+const channelBotAuthor = 'channel bot'
+const channelBotPrompts = [
+  'A miniature night train crossing a glowing paper landscape, gentle camera drift, cinematic, no text.',
+  'A tiny radio tower on a floating island sending music into a pink dawn sky, dreamy cinematic light, no text.',
+  'A jellyfish-shaped lantern drifting through a quiet underwater library, soft bioluminescence, no text.',
+  'A small orange robot watering a rooftop garden after rain, warm reflections, cinematic, no text.',
+  'A moonlit carousel made of clouds turning slowly above a sleeping city, magical realism, no text.',
+  'A tiny sailboat sailing through a field of blue flowers at sunrise, calm cinematic movement, no text.',
+  'A cozy bookstore inside a moving tram, golden afternoon light and drifting dust, no text.',
+  'A friendly robot DJ mixing records beneath an aurora, playful neon light, no text.',
+] as const
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -146,6 +159,19 @@ function configuredChatPageLimit(env: WorkerEnv) {
 
 function configuredDailyGenerationBudget(env: WorkerEnv) {
   return boundedEnvNumber(env.MAX_PAID_GENERATIONS_PER_DAY, defaultDailyGenerationBudget, 0, 10_000)
+}
+
+function channelBotEnabled(env: WorkerEnv) {
+  return env.CHANNEL_BOT_ENABLED === 'true'
+}
+
+function configuredChannelBotIntervalMs(env: WorkerEnv) {
+  return boundedEnvNumber(
+    env.CHANNEL_BOT_INTERVAL_MINUTES,
+    defaultChannelBotIntervalMinutes,
+    15,
+    24 * 60,
+  ) * 60_000
 }
 
 function securityHeaders(headers: Headers, requestId: string) {
@@ -312,6 +338,44 @@ async function upsertVisitor(env: WorkerEnv, visitorId: string, now: number) {
     INSERT INTO visitors(id, created_at, last_seen_at) VALUES (?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at
   `).bind(visitorId, now, now).run()
+}
+
+async function queueChannelBotPrompt(env: WorkerEnv) {
+  if (!channelBotEnabled(env)) return false
+
+  const now = Date.now()
+  const intervalMs = configuredChannelBotIntervalMs(env)
+  const prompt = channelBotPrompts[Math.floor(now / intervalMs) % channelBotPrompts.length]
+  const moderation = moderatePrompt(prompt)
+  if (moderation.decision !== 'approve') {
+    console.error(JSON.stringify({ event: 'channel_bot_prompt_not_approved', reason: moderation.reason }))
+    return false
+  }
+
+  await upsertVisitor(env, channelBotVisitorId, now)
+  const inserted = await env.DB.prepare(`
+    INSERT INTO ideas(
+      visitor_id, author, body, normalized_body, status, moderation_reason,
+      created_at, status_changed_at
+    )
+    SELECT ?, ?, ?, ?, 'queued', 'automated_channel_bot', ?, ?
+    WHERE NOT EXISTS (
+      SELECT 1 FROM ideas
+      WHERE visitor_id = ? AND created_at >= ? AND status != 'rejected'
+    )
+  `).bind(
+    channelBotVisitorId,
+    channelBotAuthor,
+    prompt,
+    normalizePrompt(prompt).toLocaleLowerCase('en'),
+    now,
+    now,
+    channelBotVisitorId,
+    now - intervalMs,
+  ).run()
+  if (Number(inserted.meta.changes ?? 0) === 0) return false
+  await bumpRevision(env, now)
+  return true
 }
 
 async function hashSubject(scope: string, subject: string) {
@@ -1113,6 +1177,7 @@ const worker: ExportedHandler<WorkerEnv> = {
   async scheduled(_controller, env, execution) {
     execution.waitUntil((async () => {
       await reconcileStaleGenerations(env)
+      await queueChannelBotPrompt(env)
       await dispatchQueued(env)
     })())
   },

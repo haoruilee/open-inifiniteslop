@@ -49,7 +49,9 @@
     "VIDEO_ARCHIVE_LIMIT": "160",
     "CHAT_SNAPSHOT_LIMIT": "60",
     "CHAT_PAGE_LIMIT": "100",
-    "MAX_PAID_GENERATIONS_PER_DAY": "100"
+    "MAX_PAID_GENERATIONS_PER_DAY": "100",
+    "CHANNEL_BOT_ENABLED": "true",
+    "CHANNEL_BOT_INTERVAL_MINUTES": "60"
   },
   "observability": {
     "enabled": true
