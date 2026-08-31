@@ -209,7 +209,7 @@ function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | '
     return Number(idea.requested_duration_seconds)
   }
   if (idea.author !== channelBotAuthor) return configuredGenerationDuration(env)
-  return modelForIdea(env, idea) === 'wan2.7-t2v' ? 15 : 10
+  return Number(idea.id) % 2 === 0 ? 15 : 10
 }
 
 function channelBotEnabled(env: WorkerEnv) {
