@@ -5,7 +5,10 @@ import { ChannelOrchestrator } from './orchestrator.js'
 import { createVideoProvider } from './video-provider.js'
 
 const config = loadConfig()
-const database = new ChannelDatabase(config.databasePath, { provider: config.provider })
+const database = new ChannelDatabase(config.databasePath, {
+  provider: config.provider,
+  seed: config.seedDemoQueue,
+})
 const app = createChannelHttpApp(database, config)
 const provider = createVideoProvider(config)
 const orchestrator = new ChannelOrchestrator(database, provider, {

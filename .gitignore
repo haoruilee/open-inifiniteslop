@@ -2,6 +2,12 @@ node_modules
 dist
 server-dist
 data
+.env
+.env.*
+!.env.example
+.credentials/
+credentials/
+.secrets/
 .DS_Store
 *.log
 *.tsbuildinfo

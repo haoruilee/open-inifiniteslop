@@ -10,6 +10,7 @@ export type RuntimeConfig = {
   secureCookies: boolean
   trustProxy: boolean
   provider: 'mock' | 'fal'
+  seedDemoQueue: boolean
   falKey: string | null
   falModel: string
   generationConcurrency: number
@@ -51,6 +52,7 @@ export function loadConfig(
     secureCookies: booleanValue(environment.SECURE_COOKIES, environment.NODE_ENV === 'production'),
     trustProxy: booleanValue(environment.TRUST_PROXY, false),
     provider,
+    seedDemoQueue: booleanValue(environment.SEED_DEMO_QUEUE, provider === 'mock'),
     falKey: environment.FAL_KEY?.trim() || null,
     falModel: environment.FAL_MODEL?.trim() || 'minimax/h3-max/text-to-video',
     generationConcurrency: integerValue(environment.GENERATION_CONCURRENCY, 1, 1, 4),

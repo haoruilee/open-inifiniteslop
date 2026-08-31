@@ -43,16 +43,22 @@ async function stop(child) {
 }
 
 function startServer(port, directory, output) {
+  const inheritedEnvironment = Object.fromEntries(
+    ['LANG', 'LC_ALL', 'PATH', 'TMPDIR', 'TZ']
+      .filter((name) => globalThis.process.env[name] !== undefined)
+      .map((name) => [name, globalThis.process.env[name]]),
+  )
   const child = spawn(globalThis.process.execPath, ['server-dist/index.js'], {
     cwd: fileURLToPath(new URL('..', import.meta.url)),
     env: {
-      ...globalThis.process.env,
+      ...inheritedEnvironment,
       NODE_ENV: 'production',
       HOST: '127.0.0.1',
       PORT: String(port),
       DATABASE_PATH: join(directory, 'channel.sqlite'),
       MEDIA_DIR: join(directory, 'videos'),
       VIDEO_PROVIDER: 'mock',
+      SEED_DEMO_QUEUE: 'true',
       MOCK_GENERATION_DELAY_MS: '10',
       WORKER_INTERVAL_MS: '50',
       ROTATION_INTERVAL_MS: '50',
