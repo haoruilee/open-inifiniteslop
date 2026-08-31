@@ -4,11 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
+    "dev": "concurrently -k -n api,web -c magenta,cyan \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:client": "vite --host 127.0.0.1",
+    "dev:server": "tsx watch server/index.ts",
     "build:client": "tsc --noEmit && vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "build": "pnpm build:client && pnpm build:server",
-    "test": "tsx --test server/tests/*.test.ts",
+    "test": "NODE_ENV=test tsx --test server/tests/*.test.ts",
+    "start": "node server-dist/index.js",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
