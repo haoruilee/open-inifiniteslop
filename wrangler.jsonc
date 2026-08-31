@@ -40,9 +40,10 @@
   ],
   "vars": {
     "ORANGE_API_BASE": "https://api.orangeapi.chat/v1",
-    "ORANGE_MODEL": "seedance-2-5",
+    "ORANGE_MODEL": "wan2.7-t2v",
     "ORANGE_DURATION_SECONDS": "10",
     "ORANGE_RESOLUTION": "720P",
+    "GROK_RESOLUTION": "480P",
     "ORANGE_RATIO": "16:9",
     "ORANGE_WATERMARK": "true",
     "VIDEO_BUFFER_TARGET": "8",

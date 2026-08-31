@@ -44,6 +44,7 @@ type IdeaRow = {
   poster_url: string | null
   duration_seconds: number | null
   requested_duration_seconds: number | null
+  requested_model: string | null
   generation_progress: string | null
   error: string | null
   play_count: number
@@ -106,7 +107,9 @@ const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
 const defaultChannelBotIntervalMinutes = 10
-const maximumPolls = 60
+// Long-form providers can remain queued for several minutes; the task ID is
+// persisted first, so extending polling never creates a duplicate generation.
+const maximumPolls = 180
 const staleGenerationMs = 30 * 60_000
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
@@ -183,12 +186,24 @@ function configuredGenerationDuration(env: WorkerEnv) {
   return boundedEnvNumber(env.ORANGE_DURATION_SECONDS, 10, 1, 15)
 }
 
-function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_duration_seconds'>) {
+function modelForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_model'>) {
+  if (idea.requested_model) return idea.requested_model
+  if (idea.author === channelBotAuthor) {
+    return Number(idea.id) % 2 === 0 ? 'wan2.7-t2v' : 'grok-imagine-video'
+  }
+  return env.ORANGE_MODEL as string
+}
+
+function resolutionForModel(env: WorkerEnv, model: string) {
+  return model === 'grok-imagine-video' ? env.GROK_RESOLUTION as string : env.ORANGE_RESOLUTION as string
+}
+
+function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_duration_seconds' | 'requested_model'>) {
   if (idea.requested_duration_seconds !== null && Number.isFinite(Number(idea.requested_duration_seconds))) {
     return Number(idea.requested_duration_seconds)
   }
   if (idea.author !== channelBotAuthor) return configuredGenerationDuration(env)
-  return Number(idea.id) % 2 === 0 ? 15 : 10
+  return modelForIdea(env, idea) === 'wan2.7-t2v' ? 15 : 10
 }
 
 function channelBotEnabled(env: WorkerEnv) {
@@ -594,7 +609,7 @@ async function startPollingWorkflow(env: WorkerEnv, ideaId: number, taskId: stri
 
 async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: string) {
   const idea = await env.DB.prepare(`
-    SELECT id, author, body, provider_request_id, requested_duration_seconds
+    SELECT id, author, body, provider_request_id, requested_duration_seconds, requested_model
     FROM ideas WHERE id = ? AND status = 'generating'
   `).bind(ideaId).first<{
     id: number
@@ -602,6 +617,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
     body: string
     provider_request_id: string | null
     requested_duration_seconds: number | null
+    requested_model: string | null
   }>()
   if (!idea) return false
   if (idea.provider_request_id) {
@@ -614,14 +630,15 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
 
   let taskId: string | null = null
   try {
+    const model = modelForIdea(env, idea)
     const durationSeconds = durationForIdea(env, idea)
-    const model = env.ORANGE_MODEL as string
+    const resolution = resolutionForModel(env, model)
     const generationBody = model === 'happyhorse-1.0-t2v'
       ? {
           model,
           prompt: idea.body,
           seconds: String(durationSeconds),
-          resolution: env.ORANGE_RESOLUTION,
+          resolution,
           ratio: env.ORANGE_RATIO,
           watermark: env.ORANGE_WATERMARK === 'true',
         }
@@ -629,7 +646,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
           model,
           prompt: idea.body,
           duration: durationSeconds,
-          resolution: env.ORANGE_RESOLUTION,
+          resolution,
           ratio: env.ORANGE_RATIO,
           watermark: env.ORANGE_WATERMARK === 'true',
         }
@@ -643,10 +660,10 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
     if (!taskId) throw new Error('orange_task_id_missing')
     const persisted = await env.DB.prepare(`
       UPDATE ideas
-      SET provider_request_id = ?, requested_duration_seconds = ?,
+      SET provider_request_id = ?, requested_duration_seconds = ?, requested_model = ?,
           generation_progress = 'provider_queued', error = NULL
       WHERE id = ? AND status = 'generating' AND provider_request_id IS NULL
-    `).bind(taskId, durationSeconds, ideaId).run()
+    `).bind(taskId, durationSeconds, model, ideaId).run()
     if (Number(persisted.meta.changes ?? 0) === 0) {
       throw new Error('orange_submission_persist_failed')
     }
@@ -1178,9 +1195,14 @@ export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Gener
       await step.do('publish generated video', async () => {
         const now = Date.now()
         const idea = await this.env.DB.prepare(`
-          SELECT id, author, requested_duration_seconds
+          SELECT id, author, requested_duration_seconds, requested_model
           FROM ideas WHERE id = ? AND status = 'generating'
-        `).bind(ideaId).first<{ id: number; author: string; requested_duration_seconds: number | null }>()
+        `).bind(ideaId).first<{
+          id: number
+          author: string
+          requested_duration_seconds: number | null
+          requested_model: string | null
+        }>()
         if (!idea) throw new NonRetryableError('idea_publish_state_changed')
         const updated = await this.env.DB.prepare(`
           UPDATE ideas
