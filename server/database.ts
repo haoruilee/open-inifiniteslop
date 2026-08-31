@@ -655,7 +655,17 @@ export class ChannelDatabase {
   snapshot(providerOverride?: string): ChannelSnapshot {
     const channel = this.db.prepare('SELECT * FROM channel_state WHERE singleton = 1').get() as ChannelRow
     const nowPlaying = this.listByStatus('playing', 1, 'i.status_changed_at ASC, i.id ASC')[0] ?? null
-    const playingNext = this.listByStatus('ready', 20, 'i.status_changed_at ASC, i.id ASC')
+    const freshNext = this.listByStatus('ready', 20, 'i.status_changed_at ASC, i.id ASC')
+    const replaySlots = Math.max(0, 4 - freshNext.length)
+    const replayNext = replaySlots > 0
+      ? (this.db.prepare(`${publicStatusSql}
+          WHERE i.status = 'aired' AND (i.video_url IS NOT NULL OR i.video_path IS NOT NULL)
+          GROUP BY i.id
+          ORDER BY i.play_count ASC, i.status_changed_at ASC, i.id ASC
+          LIMIT ?
+        `).all(replaySlots) as IdeaRow[]).map(mapIdea)
+      : []
+    const playingNext = [...freshNext, ...replayNext]
     const generatingNow = this.listByStatus('generating', 20, 'i.status_changed_at ASC, i.id ASC')
     const queue = this.listByStatus('queued', 50, 'votes DESC, i.created_at ASC, i.id ASC')
     const chatRows = this.db.prepare(`${publicStatusSql}

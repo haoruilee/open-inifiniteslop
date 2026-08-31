@@ -293,7 +293,7 @@ function noticeForError(error: unknown) {
 
 function App() {
   const isDesktop = useDeskQueue()
-  const { snapshot, connection, error: connectionError, refresh } = useChannel()
+  const { snapshot, error: connectionError, refresh } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<'chat' | 'queue'>('chat')
@@ -316,10 +316,13 @@ function App() {
   const generatingNow = useMemo(() => (snapshot?.generatingNow ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.generatingNow, nickname])
   const queue = useMemo(() => (snapshot?.queue ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.queue, nickname])
   const nowPlaying = snapshot?.nowPlaying
+  const preloadedVideo = snapshot?.playingNext.find((idea) => (
+    Boolean(idea.videoUrl) && idea.id !== nowPlaying?.id
+  ))
 
   useEffect(() => {
     setFailedVideoId(null)
-  }, [nowPlaying?.id, nowPlaying?.videoUrl])
+  }, [nowPlaying?.id, nowPlaying?.videoUrl, nowPlaying?.startedAt])
 
   useEffect(() => () => {
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current)
@@ -450,13 +453,18 @@ function App() {
             onEnded={() => window.setTimeout(() => void refresh(), 250)}
           />
         ) : null}
+        {preloadedVideo?.videoUrl ? (
+          <video
+            className="video-preloader"
+            src={preloadedVideo.videoUrl}
+            muted
+            playsInline
+            preload="auto"
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+        ) : null}
       </div>
-
-      {tunedIn ? (
-        <div className={`live-pill ${connection !== 'live' ? 'syncing' : ''}`}>
-          <span />{connection === 'live' ? 'LIVE' : 'SYNCING'}
-        </div>
-      ) : null}
 
       <div className="top-left">
         <div className="now-playing">

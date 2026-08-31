@@ -220,3 +220,33 @@ test('plays a freshly generated clip before replaying the archive', () => {
     database.close()
   }
 })
+
+test('publishes archived clips as upcoming replay slots when the fresh buffer is empty', () => {
+  let now = 40_000
+  const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })
+  try {
+    const first = database.createSubmission(
+      'schedule-first',
+      'first',
+      'a coral airship circles a quiet island',
+      moderatePrompt('a coral airship circles a quiet island'),
+    ).idea
+    markReady(database, first.id)
+    const second = database.createSubmission(
+      'schedule-second',
+      'second',
+      'a clockwork whale swims through pink clouds',
+      moderatePrompt('a clockwork whale swims through pink clouds'),
+    ).idea
+    markReady(database, second.id)
+    database.advancePlayback()
+    now += 1_001
+    database.advancePlayback()
+
+    const snapshot = database.snapshot()
+    assert.equal(snapshot.nowPlaying?.id, second.id)
+    assert.deepEqual(snapshot.playingNext.map((idea) => idea.id), [first.id])
+  } finally {
+    database.close()
+  }
+})

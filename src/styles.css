@@ -95,14 +95,18 @@ a:focus-visible,
   background: #000;
 }
 
-.tv-wrap.playing .video-frame {
-  filter: saturate(.92) brightness(.87);
-  animation: broadcast-drift 16s ease-in-out infinite alternate;
+.video-preloader {
+  position: fixed;
+  top: -2px;
+  left: -2px;
+  width: 1px;
+  height: 1px;
+  opacity: .001;
+  pointer-events: none;
 }
 
-@keyframes broadcast-drift {
-  from { object-position: 50% 48%; }
-  to { object-position: 50% 53%; }
+.tv-wrap.playing .video-frame {
+  filter: none;
 }
 
 .splash {
@@ -201,40 +205,6 @@ a:focus-visible,
   width: .95em;
   height: .95em;
   fill: currentColor;
-}
-
-.live-pill {
-  position: fixed;
-  top: 14px;
-  left: 50%;
-  z-index: 40;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 15px;
-  color: #fff;
-  border-radius: 999px;
-  background: #e11d2a;
-  box-shadow: 0 3px 12px rgba(0, 0, 0, .45);
-  font: 700 12px/1 system-ui, sans-serif;
-  letter-spacing: .4px;
-  transform: translateX(-50%);
-}
-
-.live-pill span {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #fff;
-  animation: live-dot 1.4s ease-in-out infinite;
-}
-
-.live-pill.syncing {
-  background: #ad6800;
-}
-
-@keyframes live-dot {
-  50% { opacity: .25; }
 }
 
 .chat-toggle,
