@@ -42,6 +42,7 @@ type IdeaRow = {
   video_key: string | null
   poster_url: string | null
   duration_seconds: number | null
+  requested_duration_seconds: number | null
   generation_progress: string | null
   error: string | null
   play_count: number
@@ -99,11 +100,11 @@ type OrangeTaskState = {
 
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
-const defaultArchiveLimit = 160
+const defaultArchiveLimit = 100
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
-const defaultChannelBotIntervalMinutes = 60
+const defaultChannelBotIntervalMinutes = 10
 const maximumPolls = 60
 const staleGenerationMs = 30 * 60_000
 const channelBotVisitorId = 'channel-bot'
@@ -117,6 +118,22 @@ const channelBotPrompts = [
   'A tiny sailboat sailing through a field of blue flowers at sunrise, calm cinematic movement, no text.',
   'A cozy bookstore inside a moving tram, golden afternoon light and drifting dust, no text.',
   'A friendly robot DJ mixing records beneath an aurora, playful neon light, no text.',
+  'A glass elevator travelling slowly through a vertical garden inside a cloud, warm afternoon glow, no text.',
+  'A small observatory on a snowy hill as constellations wake up overhead, cinematic, no text.',
+  'A glowing vending machine in a rainy alley serving tiny planets, calm camera move, no text.',
+  'A paper dragon flying above a quiet seaside town at sunset, soft cinematic light, no text.',
+  'A tea shop run by small woodland robots in a mossy forest, cozy cinematic scene, no text.',
+  'A neon sign painter working atop a high-rise balcony in gentle rain, atmospheric, no text.',
+  'A tiny astronaut tending a greenhouse on the moon, slow peaceful movement, no text.',
+  'A whale-shaped airship floating between pink mountains at dawn, dreamy cinematic, no text.',
+  'A golden retriever in a yellow raincoat walking through a miniature city made of flowers, no text.',
+  'A street musician playing under floating lanterns in a quiet night market, soft cinematic light, no text.',
+  'A futuristic laundromat where washing machines contain tiny thunderstorms, playful, no text.',
+  'A small red tram gliding through an autumn forest filled with fireflies, cinematic, no text.',
+  'A sunflower field growing on the roof of a moving train, sunny and surreal, no text.',
+  'A robot chef preparing noodles in a tiny kitchen inside a lighthouse, warm cozy light, no text.',
+  'A transparent submarine passing through an underwater city of coral towers, gentle drift, no text.',
+  'A quiet record store on a floating platform above the ocean at blue hour, cinematic, no text.',
 ] as const
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
@@ -161,6 +178,18 @@ function configuredDailyGenerationBudget(env: WorkerEnv) {
   return boundedEnvNumber(env.MAX_PAID_GENERATIONS_PER_DAY, defaultDailyGenerationBudget, 0, 10_000)
 }
 
+function configuredGenerationDuration(env: WorkerEnv) {
+  return boundedEnvNumber(env.ORANGE_DURATION_SECONDS, 10, 1, 15)
+}
+
+function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_duration_seconds'>) {
+  if (idea.requested_duration_seconds !== null && Number.isFinite(Number(idea.requested_duration_seconds))) {
+    return Number(idea.requested_duration_seconds)
+  }
+  if (idea.author !== channelBotAuthor) return configuredGenerationDuration(env)
+  return Number(idea.id) % 2 === 0 ? 15 : 10
+}
+
 function channelBotEnabled(env: WorkerEnv) {
   return env.CHANNEL_BOT_ENABLED === 'true'
 }
@@ -169,7 +198,7 @@ function configuredChannelBotIntervalMs(env: WorkerEnv) {
   return boundedEnvNumber(
     env.CHANNEL_BOT_INTERVAL_MINUTES,
     defaultChannelBotIntervalMinutes,
-    15,
+    5,
     24 * 60,
   ) * 60_000
 }
@@ -564,8 +593,15 @@ async function startPollingWorkflow(env: WorkerEnv, ideaId: number, taskId: stri
 
 async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: string) {
   const idea = await env.DB.prepare(`
-    SELECT id, body, provider_request_id FROM ideas WHERE id = ? AND status = 'generating'
-  `).bind(ideaId).first<{ id: number; body: string; provider_request_id: string | null }>()
+    SELECT id, author, body, provider_request_id, requested_duration_seconds
+    FROM ideas WHERE id = ? AND status = 'generating'
+  `).bind(ideaId).first<{
+    id: number
+    author: string
+    body: string
+    provider_request_id: string | null
+    requested_duration_seconds: number | null
+  }>()
   if (!idea) return false
   if (idea.provider_request_id) {
     return startPollingWorkflow(env, ideaId, idea.provider_request_id, workflowId)
@@ -577,26 +613,39 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number, workflowId: 
 
   let taskId: string | null = null
   try {
+    const durationSeconds = durationForIdea(env, idea)
+    const model = env.ORANGE_MODEL as string
+    const generationBody = model === 'happyhorse-1.0-t2v'
+      ? {
+          model,
+          prompt: idea.body,
+          seconds: String(durationSeconds),
+          resolution: env.ORANGE_RESOLUTION,
+          ratio: env.ORANGE_RATIO,
+          watermark: env.ORANGE_WATERMARK === 'true',
+        }
+      : {
+          model,
+          prompt: idea.body,
+          duration: durationSeconds,
+          resolution: env.ORANGE_RESOLUTION,
+          ratio: env.ORANGE_RATIO,
+          watermark: env.ORANGE_WATERMARK === 'true',
+        }
     const response = await fetch(`${env.ORANGE_API_BASE.replace(/\/+$/u, '')}/video/generations`, {
       method: 'POST',
       headers: orangeHeaders(env, true),
-      body: JSON.stringify({
-        model: env.ORANGE_MODEL,
-        prompt: idea.body,
-        seconds: env.ORANGE_DURATION_SECONDS,
-        resolution: env.ORANGE_RESOLUTION,
-        ratio: env.ORANGE_RATIO,
-        watermark: env.ORANGE_WATERMARK === 'true',
-      }),
+      body: JSON.stringify(generationBody),
       signal: AbortSignal.timeout(30_000),
     })
     taskId = taskIdFrom(await parseOrangeJson(response))
     if (!taskId) throw new Error('orange_task_id_missing')
     const persisted = await env.DB.prepare(`
       UPDATE ideas
-      SET provider_request_id = ?, generation_progress = 'provider_queued', error = NULL
+      SET provider_request_id = ?, requested_duration_seconds = ?,
+          generation_progress = 'provider_queued', error = NULL
       WHERE id = ? AND status = 'generating' AND provider_request_id IS NULL
-    `).bind(taskId, ideaId).run()
+    `).bind(taskId, durationSeconds, ideaId).run()
     if (Number(persisted.meta.changes ?? 0) === 0) {
       throw new Error('orange_submission_persist_failed')
     }
@@ -1127,13 +1176,18 @@ export class VideoGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Gener
 
       await step.do('publish generated video', async () => {
         const now = Date.now()
+        const idea = await this.env.DB.prepare(`
+          SELECT id, author, requested_duration_seconds
+          FROM ideas WHERE id = ? AND status = 'generating'
+        `).bind(ideaId).first<{ id: number; author: string; requested_duration_seconds: number | null }>()
+        if (!idea) throw new NonRetryableError('idea_publish_state_changed')
         const updated = await this.env.DB.prepare(`
           UPDATE ideas
           SET status = 'ready', status_changed_at = ?, video_key = ?,
               poster_url = '/assets/tv-frame.png', duration_seconds = ?,
               generation_progress = 'complete', error = NULL
           WHERE id = ? AND status = 'generating'
-        `).bind(now, videoKey, Number(this.env.ORANGE_DURATION_SECONDS), ideaId).run()
+        `).bind(now, videoKey, durationForIdea(this.env, idea), ideaId).run()
         if (Number(updated.meta.changes ?? 0) === 0) throw new NonRetryableError('idea_publish_state_changed')
         await bumpRevision(this.env, now)
       })
