@@ -23,13 +23,41 @@ PORT=8792 VITE_API_TARGET=http://127.0.0.1:8792 pnpm dev
 
 ## Real video generation
 
-Set the fal.ai key only in the server environment. It is never sent to the browser or included in the Vite bundle.
+### OrangeAPI
+
+On macOS, store the OrangeAPI key in Keychain. Keep `-w` last so `security` prompts instead of placing the value in shell history or process arguments:
 
 ```bash
-VIDEO_PROVIDER=fal FAL_KEY=your-server-key pnpm dev
+/usr/bin/security add-generic-password \
+  -a orangeapi-production \
+  -s open-inifiniteslop.orangeapi \
+  -l 'Open Infinite Slop OrangeAPI' \
+  -U \
+  -w
 ```
 
-The default model is `minimax/h3-max/text-to-video`, configured for 5-second, 768P, 9:16 video with the provider safety checker enabled. Generated files are downloaded into `data/videos` and served through a byte-range endpoint so playback remains stable if a provider URL expires.
+Then start the app without putting the key in the frontend or parent process environment:
+
+```bash
+VIDEO_PROVIDER=orange SEED_DEMO_QUEUE=false BUFFER_TARGET=1 pnpm dev
+```
+
+Keychain credentials are restricted to the canonical `https://api.orangeapi.chat/v1` gateway. A custom `ORANGE_API_BASE` requires its own explicit server-side `ORANGE_API_KEY`; put those variables on `pnpm dev:server` and run Vite separately. The explicit environment credential takes precedence. Real providers never seed the four mock demo jobs.
+
+The default Orange model is `happyhorse-1.0-t2v`, configured for 3-second, 720P, 16:9 video. The enabled text-to-video allowlist also includes `wan2.7-t2v`, `grok-imagine-video`, and the supported Seedance variants in [`server/orange-video-provider.ts`](./server/orange-video-provider.ts). Control requests use a browser User-Agent and never follow bearer-authenticated redirects.
+
+Once Orange returns a task ID, it is persisted before polling continues. Restarts resume that same task instead of creating another paid job. An interrupted submission with no persisted task ID fails closed as `orange_submission_state_unknown`, because the upstream contract does not document an idempotency key.
+
+### fal.ai
+
+Set the fal.ai key only in the API server environment. Run the two development processes separately so Vite never inherits it:
+
+```bash
+VIDEO_PROVIDER=fal FAL_KEY=your-server-key pnpm dev:server
+VITE_API_TARGET=http://127.0.0.1:8787 pnpm dev:client
+```
+
+The default fal.ai model is `minimax/h3-max/text-to-video`, configured for 5-second, 768P, 9:16 video with the provider safety checker enabled. Both real providers immediately download generated files into `data/videos` and serve them through a byte-range endpoint so playback remains stable after signed provider URLs expire.
 
 See [`.env.example`](./.env.example) for worker concurrency, buffer size, timeouts, rate limits, storage paths, and model overrides.
 
@@ -66,8 +94,10 @@ The Node process serves the API, SSE stream, generated media, and the built SPA 
 pnpm test   # database, API, SSE, moderation, concurrency, retry, rotation
 pnpm build  # type-check and build client + server
 pnpm smoke  # real production process, SPA/API, write, restart persistence
-pnpm check  # all gates above
+pnpm check  # all gates above, including credential leak scanning
 ```
+
+The current suite includes fake Orange gateway contract tests and an end-to-end moderation → SSE → generation → local media → playback test. See [`docs/LIVE_VALIDATION.md`](./docs/LIVE_VALIDATION.md) for the one-call production-gateway validation evidence.
 
 The deterministic mock videos can be regenerated on macOS with:
 
