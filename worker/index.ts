@@ -106,7 +106,8 @@ type PlaybackAdvanceRequest = {
 
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
-const defaultArchiveLimit = 100
+const defaultArchiveLimit = 300
+const defaultPlaybackRecencyWindow = 24
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
@@ -182,6 +183,10 @@ function configuredBufferTarget(env: WorkerEnv) {
 
 function configuredArchiveLimit(env: WorkerEnv) {
   return boundedEnvNumber(env.VIDEO_ARCHIVE_LIMIT, defaultArchiveLimit, 8, 1_000)
+}
+
+function configuredPlaybackRecencyWindow(env: WorkerEnv) {
+  return boundedEnvNumber(env.PLAYBACK_RECENCY_WINDOW, defaultPlaybackRecencyWindow, 0, 240)
 }
 
 function configuredChatSnapshotLimit(env: WorkerEnv) {
@@ -644,6 +649,41 @@ async function rows<T>(statement: D1PreparedStatement) {
   return result.results
 }
 
+async function replayCandidates(env: WorkerEnv, limit: number) {
+  if (limit <= 0) return [] as IdeaRow[]
+
+  const recencyWindow = configuredPlaybackRecencyWindow(env)
+  const standardCandidates = () => rows<IdeaRow>(env.DB.prepare(`
+    SELECT * FROM ideas WHERE status = 'aired' AND video_key IS NOT NULL
+    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT ?
+  `).bind(limit))
+  if (recencyWindow === 0) return standardCandidates()
+
+  const nonRecent = await rows<IdeaRow>(env.DB.prepare(`
+    SELECT * FROM ideas
+    WHERE status = 'aired' AND video_key IS NOT NULL
+      AND id NOT IN (
+        SELECT id FROM ideas
+        WHERE status = 'aired' AND video_key IS NOT NULL
+        ORDER BY status_changed_at DESC, id DESC LIMIT ?
+      )
+    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT ?
+  `).bind(recencyWindow, limit))
+  if (nonRecent.length >= limit) return nonRecent
+
+  // Small archives cannot always satisfy the history window. Fill the preview
+  // deterministically while keeping every item distinct where possible.
+  const selected = [...nonRecent]
+  const selectedIds = new Set(selected.map((idea) => Number(idea.id)))
+  for (const candidate of await standardCandidates()) {
+    if (selectedIds.has(Number(candidate.id))) continue
+    selected.push(candidate)
+    selectedIds.add(Number(candidate.id))
+    if (selected.length === limit) break
+  }
+  return selected
+}
+
 async function advancePlayback(env: WorkerEnv, force?: PlaybackAdvanceRequest) {
   const now = Date.now()
   const current = await env.DB.prepare(`
@@ -666,11 +706,10 @@ async function advancePlayback(env: WorkerEnv, force?: PlaybackAdvanceRequest) {
     SELECT id, status FROM ideas WHERE status = 'ready' AND video_key IS NOT NULL
     ORDER BY status_changed_at ASC, id ASC LIMIT 1
   `).first<{ id: number; status: 'ready' }>()
-  const replay = fresh ? null : await env.DB.prepare(`
-    SELECT id, status FROM ideas WHERE status = 'aired' AND video_key IS NOT NULL
-    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT 1
-  `).first<{ id: number; status: 'aired' }>()
-  const next = fresh ?? replay ?? (current ? { id: current.id, status: 'aired' as const } : null)
+  const replay = fresh ? null : (await replayCandidates(env, 1))[0]
+  const next = fresh
+    ?? (replay ? { id: Number(replay.id), status: 'aired' as const } : null)
+    ?? (current ? { id: current.id, status: 'aired' as const } : null)
 
   if (!current && !next) return
   const statements: D1PreparedStatement[] = []
@@ -1034,10 +1073,7 @@ async function channelSnapshot(env: WorkerEnv): Promise<ChannelSnapshot> {
     ORDER BY status_changed_at ASC, id ASC LIMIT ?
   `).bind(playingNextLimit))
   const replaySlots = Math.max(0, playingNextLimit - freshNext.length)
-  const replayNext = replaySlots === 0 ? [] : await rows<IdeaRow>(env.DB.prepare(`
-    SELECT * FROM ideas WHERE status = 'aired' AND video_key IS NOT NULL
-    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT ?
-  `).bind(replaySlots))
+  const replayNext = await replayCandidates(env, replaySlots)
   const generatingNow = await rows<IdeaRow>(env.DB.prepare(`
     SELECT * FROM ideas WHERE status = 'generating'
     ORDER BY status_changed_at ASC, id ASC LIMIT ?
