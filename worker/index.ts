@@ -112,6 +112,7 @@ const defaultPlaybackRecencyWindow = 48
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
+const defaultConcurrentGenerationLimit = 4
 const defaultChannelBotIntervalMinutes = 10
 const defaultChannelBotQueueTarget = 1
 const defaultTextPolishBase = 'https://ai-cpa-cf.nullatoms.com/v1'
@@ -175,6 +176,10 @@ function configuredChatPageLimit(env: WorkerEnv) {
 
 function configuredDailyGenerationBudget(env: WorkerEnv) {
   return boundedEnvNumber(env.MAX_PAID_GENERATIONS_PER_DAY, defaultDailyGenerationBudget, 0, 10_000)
+}
+
+function configuredConcurrentGenerationLimit(env: WorkerEnv) {
+  return boundedEnvNumber(env.MAX_CONCURRENT_GENERATIONS, defaultConcurrentGenerationLimit, 1, 8)
 }
 
 function configuredGenerationDuration(env: WorkerEnv) {
@@ -592,14 +597,20 @@ function utcDay(timestamp = Date.now()) {
 
 async function reserveGenerationBudget(env: WorkerEnv) {
   const maximum = configuredDailyGenerationBudget(env)
-  if (maximum === 0) return false
+  if (maximum === 0) return null
   const day = utcDay()
   const reservation = await env.DB.prepare(`
     INSERT INTO generation_budget(day, count) VALUES (?, 1)
     ON CONFLICT(day) DO UPDATE SET count = count + 1 WHERE count < ?
   `).bind(day, maximum).run()
   await env.DB.prepare('DELETE FROM generation_budget WHERE day < ?').bind(utcDay(Date.now() - 14 * 86_400_000)).run()
-  return Number(reservation.meta.changes ?? 0) > 0
+  return Number(reservation.meta.changes ?? 0) > 0 ? day : null
+}
+
+async function refundGenerationBudget(env: WorkerEnv, day: string) {
+  await env.DB.prepare(`
+    UPDATE generation_budget SET count = count - 1 WHERE day = ? AND count > 0
+  `).bind(day).run()
 }
 
 function formatClock(timestamp: number) {
@@ -753,7 +764,8 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
   }>()
   if (!idea) return false
   if (idea.provider_request_id) return true
-  if (!(await reserveGenerationBudget(env))) {
+  const budgetDay = await reserveGenerationBudget(env)
+  if (!budgetDay) {
     await failGeneration(env, ideaId, 'daily_budget_exhausted', 'daily_generation_budget_exhausted')
     return false
   }
@@ -787,6 +799,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
       body: JSON.stringify(generationBody),
       signal: AbortSignal.timeout(30_000),
     })
+    if (response.status === 429) throw new ProviderRateLimitError()
     taskId = taskIdFrom(await parseOrangeJson(response))
     if (!taskId) throw new Error('orange_task_id_missing')
     const persisted = await env.DB.prepare(`
@@ -801,6 +814,11 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
     }
     await bumpRevision(env, Date.now())
   } catch (error) {
+    if (error instanceof ProviderRateLimitError) {
+      await refundGenerationBudget(env, budgetDay)
+      await failGeneration(env, ideaId, 'provider_rate_limited', 'orange_http_429')
+      return false
+    }
     // No provider-side idempotency key is available.  Treat timeout/connection
     // ambiguity as terminal so an edge retry cannot create a duplicate paid job.
     await failGeneration(
@@ -890,6 +908,7 @@ async function failClaimedGeneration(
 }
 
 class TerminalGenerationError extends Error {}
+class ProviderRateLimitError extends Error {}
 
 async function storeCompletedVideo(env: WorkerEnv, claim: GenerationPollClaim, resultUrl: string) {
   const idea = await env.DB.prepare(`
@@ -1011,7 +1030,12 @@ async function pollGeneratingTasks(env: WorkerEnv) {
 
 async function dispatchQueued(env: WorkerEnv) {
   const target = configuredBufferTarget(env)
+  const concurrentGenerationLimit = configuredConcurrentGenerationLimit(env)
   for (let slot = 0; slot < target; slot += 1) {
+    const activeGenerations = await env.DB.prepare(`
+      SELECT COUNT(*) AS count FROM ideas WHERE status = 'generating'
+    `).first<{ count: number }>()
+    if (Number(activeGenerations?.count ?? 0) >= concurrentGenerationLimit) return
     const count = await env.DB.prepare(`
       SELECT COUNT(*) AS count FROM ideas WHERE status IN ('generating', 'ready', 'playing')
     `).first<{ count: number }>()
@@ -1029,7 +1053,8 @@ async function dispatchQueued(env: WorkerEnv) {
           generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL,
           error = NULL, generation_attempts = generation_attempts + 1, workflow_id = NULL
       WHERE id = ? AND status = 'queued'
-    `).bind(now, next.id).run()
+        AND (SELECT COUNT(*) FROM ideas WHERE status = 'generating') < ?
+    `).bind(now, next.id, concurrentGenerationLimit).run()
     if (Number(claimed.meta.changes ?? 0) === 0) continue
     await bumpRevision(env, now)
     await submitOrangeTaskOnce(env, next.id)
