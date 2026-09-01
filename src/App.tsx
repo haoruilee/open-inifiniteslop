@@ -292,7 +292,7 @@ function PlayIcon() {
   )
 }
 
-function Splash({ onTuneIn }: { onTuneIn: () => void }) {
+function Splash({ onTuneIn, tuning = false }: { onTuneIn: () => void; tuning?: boolean }) {
   return (
     <div
       className="splash"
@@ -315,8 +315,10 @@ function Splash({ onTuneIn }: { onTuneIn: () => void }) {
         </span>
         <PlayIcon />
         <span className="subtitle">
-          an endless AI-generated TV channel.<br />
-          the chat decides what airs next
+          {tuning ? 'tuning the channel…' : <>
+            an endless AI-generated TV channel.<br />
+            the chat decides what airs next
+          </>}
         </span>
         <BrandCredit compact />
       </span>
@@ -338,6 +340,7 @@ function App() {
   const isDesktop = useDeskQueue()
   const { snapshot, error: connectionError, refresh, applyLikes, applySnapshot } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
+  const [tuneRequested, setTuneRequested] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<'chat' | 'queue'>('chat')
   const [input, setInput] = useState('')
@@ -542,9 +545,10 @@ function App() {
   }
 
   function tuneIn() {
-    setTunedIn(true)
+    setTuneRequested(true)
     const activeVideo = activeSlotRef.current === 'a' ? videoARef.current : videoBRef.current
-    if (activeVideo) {
+    if (activeVideo && activeVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      setTunedIn(true)
       activeVideo.muted = false
       void activeVideo.play().catch(() => undefined)
     }
@@ -628,20 +632,22 @@ function App() {
       if (video.currentTime > 0) video.currentTime = 0
       activeSlotRef.current = slot
       setActiveSlot(slot)
+      if (tuneRequested) setTunedIn(true)
       window.setTimeout(() => {
         if (activeSlotRef.current === slot) videoForSlot(previousSlot)?.pause()
       }, 360)
     }
     playSlot(slot)
-  }, [nowPlayingKey, playSlot, videoForSlot])
+  }, [nowPlayingKey, playSlot, tuneRequested, videoForSlot])
 
   const handleCanPlay = useCallback((slot: PlaybackSlot) => {
     if (slot === activeSlotRef.current) {
+      if (tuneRequested) setTunedIn(true)
       playSlot(slot)
       return
     }
     if (playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey) promoteSlot(slot)
-  }, [nowPlayingKey, playSlot, promoteSlot])
+  }, [nowPlayingKey, playSlot, promoteSlot, tuneRequested])
 
   const handleVideoFailure = useCallback((slot: PlaybackSlot) => {
     const source = slotPlaybackRef.current[slot]
@@ -811,7 +817,7 @@ function App() {
       ))}
 
       {statusNotice ? <div className="action-notice" role="status">{statusNotice}</div> : null}
-      {!tunedIn ? <Splash onTuneIn={tuneIn} /> : null}
+      {!tunedIn ? <Splash onTuneIn={tuneIn} tuning={tuneRequested} /> : null}
 
       {nameModal ? (
         <>
