@@ -49,6 +49,8 @@
     "MAX_PAID_GENERATIONS_PER_DAY": "100",
     "CHANNEL_BOT_ENABLED": "true",
     "CHANNEL_BOT_GROK_ENABLED": "false",
+    "CHANNEL_BOT_FREE_MODEL": "agnes-video-v2.0",
+    "CHANNEL_BOT_FREE_MODEL_EVERY": "3",
     "CHANNEL_BOT_INTERVAL_MINUTES": "10"
   },
   "observability": {

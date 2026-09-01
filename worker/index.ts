@@ -1,5 +1,6 @@
 import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
 import { mp4DurationSeconds } from './mp4-duration.js'
+import { requiresOrangeGatewayAuth } from './orange-media.js'
 
 type WorkerEnv = Env & {
   ORANGE_API_KEY?: string
@@ -268,9 +269,23 @@ function channelBotGrokEnabled(env: WorkerEnv) {
   return (env.CHANNEL_BOT_GROK_ENABLED as string) === 'true'
 }
 
+function configuredChannelBotFreeModel(env: WorkerEnv) {
+  const model = typeof env.CHANNEL_BOT_FREE_MODEL === 'string'
+    ? env.CHANNEL_BOT_FREE_MODEL.trim()
+    : ''
+  return model || null
+}
+
+function configuredChannelBotFreeModelEvery(env: WorkerEnv) {
+  return boundedEnvNumber(env.CHANNEL_BOT_FREE_MODEL_EVERY, 0, 0, 100)
+}
+
 function modelForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'requested_model'>) {
   if (idea.requested_model) return idea.requested_model
   if (idea.author === channelBotAuthor) {
+    const freeModel = configuredChannelBotFreeModel(env)
+    const every = configuredChannelBotFreeModelEvery(env)
+    if (freeModel && every > 0 && Number(idea.id) % every === 0) return freeModel
     return channelBotGrokEnabled(env) && Number(idea.id) % 2 !== 0
       ? 'grok-imagine-video'
       : 'wan2.7-t2v'
@@ -279,6 +294,7 @@ function modelForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | 'req
 }
 
 function resolutionForModel(env: WorkerEnv, model: string) {
+  if (model === 'agnes-video-v2.0') return '720P'
   return model === 'grok-imagine-video' ? env.GROK_RESOLUTION as string : env.ORANGE_RESOLUTION as string
 }
 
@@ -286,6 +302,7 @@ function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | '
   if (idea.requested_duration_seconds !== null && Number.isFinite(Number(idea.requested_duration_seconds))) {
     return Number(idea.requested_duration_seconds)
   }
+  if (modelForIdea(env, idea) === 'agnes-video-v2.0') return 5
   if (idea.author !== channelBotAuthor) return configuredGenerationDuration(env)
   return Number(idea.id) % 2 === 0 ? 15 : 10
 }
@@ -862,10 +879,21 @@ async function storeCompletedVideo(env: WorkerEnv, claim: GenerationPollClaim, r
   `).bind(claim.ideaId, claim.token).run()
   if (Number(storing.meta.changes ?? 0) === 0) return false
 
-  const response = await fetch(resultUrl, {
+  let response = await fetch(resultUrl, {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; InfiniteAISlop/1.0)' },
     signal: AbortSignal.timeout(120_000),
   })
+  if (
+    (response.status === 401 || response.status === 403)
+    && requiresOrangeGatewayAuth(env.ORANGE_API_BASE, resultUrl)
+  ) {
+    const headers = orangeHeaders(env)
+    headers.set('Accept', 'video/mp4, application/octet-stream;q=0.9, */*;q=0.1')
+    response = await fetch(resultUrl, {
+      headers,
+      signal: AbortSignal.timeout(120_000),
+    })
+  }
   if (!response.ok) throw new Error(`orange_media_http_${response.status}`)
   const declaredLength = Number(response.headers.get('Content-Length') || 0)
   if (declaredLength > maximumVideoBytes) throw new TerminalGenerationError('video_exceeds_kv_limit_enable_r2')
