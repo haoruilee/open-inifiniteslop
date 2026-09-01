@@ -1,5 +1,6 @@
 import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  advanceChannelPlayback,
   ChannelApiError,
   type ChannelIdea,
   likeChannel,
@@ -325,7 +326,7 @@ function noticeForError(error: unknown) {
 
 function App() {
   const isDesktop = useDeskQueue()
-  const { snapshot, error: connectionError, refresh, applyLikes } = useChannel()
+  const { snapshot, error: connectionError, refresh, applyLikes, applySnapshot } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<'chat' | 'queue'>('chat')
@@ -349,6 +350,7 @@ function App() {
   const chatHistoryExhausted = useRef(false)
   const endedPlaybackKey = useRef<string | null>(null)
   const playbackRetryTimers = useRef<number[]>([])
+  const playbackAdvanceInFlight = useRef<string | null>(null)
 
   const chatIdeas = useMemo(() => {
     const latest = snapshot?.chat ?? []
@@ -390,6 +392,9 @@ function App() {
     if (endedPlaybackKey.current !== null && endedPlaybackKey.current !== nowPlayingKey) {
       endedPlaybackKey.current = null
       clearPlaybackRetries()
+    }
+    if (playbackAdvanceInFlight.current !== null && playbackAdvanceInFlight.current !== nowPlayingKey) {
+      playbackAdvanceInFlight.current = null
     }
   }, [clearPlaybackRetries, nowPlayingKey])
 
@@ -531,28 +536,54 @@ function App() {
   const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
   const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
 
+  const requestPlaybackAdvance = useCallback(async () => {
+    const playback = nowPlaying
+    const startedAt = playback?.startedAt
+    if (!playback || !nowPlayingKey || typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt)) return
+    if (playbackAdvanceInFlight.current === nowPlayingKey) return
+
+    playbackAdvanceInFlight.current = nowPlayingKey
+    try {
+      applySnapshot(await advanceChannelPlayback(playback.id, startedAt))
+    } catch {
+      void refresh()
+    } finally {
+      const requestKey = nowPlayingKey
+      window.setTimeout(() => {
+        if (playbackAdvanceInFlight.current === requestKey) playbackAdvanceInFlight.current = null
+      }, 1_500)
+    }
+  }, [applySnapshot, nowPlaying, nowPlayingKey, refresh])
+
   const handleVideoEnded = useCallback(() => {
     if (!nowPlayingKey || endedPlaybackKey.current === nowPlayingKey) return
 
     endedPlaybackKey.current = nowPlayingKey
     clearPlaybackRetries()
     const requestNext = () => {
-      if (endedPlaybackKey.current === nowPlayingKey) void refresh()
+      if (endedPlaybackKey.current === nowPlayingKey) void requestPlaybackAdvance()
     }
 
     requestNext()
     for (const delay of [500, 1_200, 2_400, 4_000]) {
       playbackRetryTimers.current.push(window.setTimeout(requestNext, delay))
     }
-  }, [clearPlaybackRetries, nowPlayingKey, refresh])
+  }, [clearPlaybackRetries, nowPlayingKey, requestPlaybackAdvance])
 
   useEffect(() => {
     const video = videoRef.current
     if (!video || !showVideo) return
 
     const startPlayback = () => {
-      video.muted = !tunedIn
-      void video.play().catch(() => undefined)
+      // A fresh video element with sound can be autoplay-blocked after each
+      // carousel handoff. Start muted, then restore sound only after playback
+      // has actually started.
+      video.muted = true
+      void video.play().then(() => {
+        if (video.isConnected && tunedIn) video.muted = false
+      }).catch(() => {
+        void requestPlaybackAdvance()
+      })
     }
 
     video.addEventListener('canplay', startPlayback)
@@ -561,7 +592,21 @@ function App() {
       video.removeEventListener('canplay', startPlayback)
       window.clearTimeout(timer)
     }
-  }, [nowPlaying?.id, nowPlaying?.startedAt, nowPlaying?.videoUrl, showVideo, tunedIn])
+  }, [nowPlaying?.id, nowPlaying?.startedAt, nowPlaying?.videoUrl, requestPlaybackAdvance, showVideo, tunedIn])
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !showVideo || !nowPlayingKey) return
+
+    const watchdog = window.setTimeout(() => {
+      if (document.visibilityState !== 'visible') return
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.paused) {
+        void requestPlaybackAdvance()
+      }
+    }, 8_000)
+
+    return () => window.clearTimeout(watchdog)
+  }, [nowPlayingKey, requestPlaybackAdvance, showVideo])
 
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
@@ -575,12 +620,12 @@ function App() {
             src={nowPlaying?.videoUrl || undefined}
             poster={poster}
             autoPlay
-            muted={!tunedIn}
+            muted
             playsInline
             preload="auto"
             onError={() => {
               setFailedVideoId(nowPlaying?.id ?? null)
-              void refresh()
+              void requestPlaybackAdvance()
             }}
             onEnded={handleVideoEnded}
           />

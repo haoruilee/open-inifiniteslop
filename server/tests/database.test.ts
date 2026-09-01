@@ -191,6 +191,38 @@ test('rotates archived clips without immediately repeating the clip that just ai
   }
 })
 
+test('advances only when a playback failure report matches the active clip', () => {
+  let now = 25_000
+  const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })
+  try {
+    const first = database.createSubmission(
+      'active-viewer',
+      'active',
+      'a small tram crossing a glass bridge at dusk',
+      moderatePrompt('a small tram crossing a glass bridge at dusk'),
+    ).idea
+    markReady(database, first.id, 60)
+    const second = database.createSubmission(
+      'standby-viewer',
+      'standby',
+      'a quiet lighthouse turning above a pink ocean',
+      moderatePrompt('a quiet lighthouse turning above a pink ocean'),
+    ).idea
+    markReady(database, second.id, 60)
+    database.advancePlayback()
+
+    const startedAt = database.snapshot().nowPlaying?.startedAt
+    assert.equal(typeof startedAt, 'number')
+    assert.equal(database.advancePlayback({ ideaId: first.id, startedAt: startedAt! - 1 }).changed, false)
+    assert.equal(database.snapshot().nowPlaying?.id, first.id)
+
+    assert.equal(database.advancePlayback({ ideaId: first.id, startedAt: startedAt! }).changed, true)
+    assert.equal(database.snapshot().nowPlaying?.id, second.id)
+  } finally {
+    database.close()
+  }
+})
+
 test('plays a freshly generated clip before replaying the archive', () => {
   let now = 30_000
   const database = new ChannelDatabase(':memory:', { seed: false, now: () => now })

@@ -98,6 +98,11 @@ type GenerationPollClaim = {
   token: string
 }
 
+type PlaybackAdvanceRequest = {
+  ideaId: number
+  startedAt: number
+}
+
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
 const defaultArchiveLimit = 100
@@ -457,6 +462,23 @@ function validateEmptyObject(input: unknown) {
   }
 }
 
+function validatePlaybackAdvance(input: unknown): PlaybackAdvanceRequest {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid request')
+  }
+  const value = input as Record<string, unknown>
+  const ideaId = value.ideaId
+  const startedAt = value.startedAt
+  if (
+    !Number.isSafeInteger(ideaId) || Number(ideaId) <= 0
+    || !Number.isSafeInteger(startedAt) || Number(startedAt) <= 0
+    || Object.keys(value).length !== 2
+  ) {
+    throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid request')
+  }
+  return { ideaId: Number(ideaId), startedAt: Number(startedAt) }
+}
+
 async function upsertVisitor(env: WorkerEnv, visitorId: string, now: number) {
   await env.DB.prepare(`
     INSERT INTO visitors(id, created_at, last_seen_at) VALUES (?, ?, ?)
@@ -605,13 +627,21 @@ async function rows<T>(statement: D1PreparedStatement) {
   return result.results
 }
 
-async function advancePlayback(env: WorkerEnv) {
+async function advancePlayback(env: WorkerEnv, force?: PlaybackAdvanceRequest) {
   const now = Date.now()
   const current = await env.DB.prepare(`
     SELECT * FROM ideas WHERE status = 'playing'
     ORDER BY status_changed_at ASC, id ASC LIMIT 1
   `).first<IdeaRow>()
-  if (current && now - Number(current.status_changed_at) < Number(current.duration_seconds ?? 10) * 1_000) {
+  const currentStartedAt = Number(current?.status_changed_at)
+  const forceMatchesCurrent = Boolean(
+    force && current && Number(current.id) === force.ideaId && currentStartedAt === force.startedAt,
+  )
+  if (
+    current
+    && !forceMatchesCurrent
+    && now - currentStartedAt < Number(current.duration_seconds ?? 10) * 1_000
+  ) {
     return
   }
 
@@ -1235,6 +1265,13 @@ async function handleApi(request: Request, env: WorkerEnv, context: RequestConte
     const result = await createSubmission(env, context, input.nickname, input.message)
     if (result.idea.status === 'queued') scheduleDispatch(execution, env)
     return json({ idea: toPublicIdea(result.idea), revision: result.revision }, 201)
+  }
+  if (method === 'POST' && pathname === '/api/playback/advance') {
+    await takeSubjectRateLimits(env, 'playback', context, 30, 180)
+    const requested = validatePlaybackAdvance(await readJson(request))
+    await advancePlayback(env, requested)
+    scheduleDispatch(execution, env)
+    return json(await channelSnapshot(env))
   }
   const voteMatch = pathname.match(/^\/api\/queue\/(\d+)\/votes$/u)
   if (method === 'POST' && voteMatch) {

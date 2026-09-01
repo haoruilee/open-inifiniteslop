@@ -217,6 +217,65 @@ test('enforces independent mutation rate limits and same-origin writes', async (
   }
 })
 
+test('advances a matching stalled playback request and rejects a cross-site request', async () => {
+  const server = await startTestServer()
+  try {
+    const first = server.database.createSubmission(
+      'playback-a',
+      'playback_a',
+      'a moonlit carousel drifting over a quiet city',
+      { decision: 'approve', reason: null },
+    ).idea
+    server.database.claimNextForGeneration('mock')
+    server.database.completeGeneration(first.id, {
+      videoUrl: '/assets/mock-loop-a.mp4',
+      videoPath: null,
+      posterUrl: '/assets/tv-frame.png',
+      durationSeconds: 60,
+      providerRequestId: 'mock-playback-a',
+    })
+    const second = server.database.createSubmission(
+      'playback-b',
+      'playback_b',
+      'a tiny observatory under a glowing northern sky',
+      { decision: 'approve', reason: null },
+    ).idea
+    server.database.claimNextForGeneration('mock')
+    server.database.completeGeneration(second.id, {
+      videoUrl: '/assets/mock-loop-b.mp4',
+      videoPath: null,
+      posterUrl: '/assets/tv-frame.png',
+      durationSeconds: 60,
+      providerRequestId: 'mock-playback-b',
+    })
+    server.database.advancePlayback()
+    const active = server.database.snapshot().nowPlaying
+    assert.ok(active?.startedAt)
+
+    const stale = await server.jsonRequest('/api/playback/advance', {
+      ideaId: active.id,
+      startedAt: active.startedAt - 1,
+    })
+    assert.equal(stale.status, 200)
+    assert.equal((await stale.json() as ChannelSnapshot).nowPlaying?.id, first.id)
+
+    const advanced = await server.jsonRequest('/api/playback/advance', {
+      ideaId: active.id,
+      startedAt: active.startedAt,
+    })
+    assert.equal(advanced.status, 200)
+    assert.equal((await advanced.json() as ChannelSnapshot).nowPlaying?.id, second.id)
+
+    const crossSite = await server.jsonRequest('/api/playback/advance', {
+      ideaId: second.id,
+      startedAt: server.database.snapshot().nowPlaying?.startedAt,
+    }, { headers: { Origin: 'https://attacker.invalid', 'Sec-Fetch-Site': 'cross-site' } })
+    assert.equal(crossSite.status, 403)
+  } finally {
+    await server.close()
+  }
+})
+
 test('serves original-compatible status and chat read contracts', async () => {
   const server = await startTestServer()
   try {

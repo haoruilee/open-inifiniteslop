@@ -119,6 +119,10 @@ export function likeChannel() {
   return postJson<{ likes: number; revision: number }>('/api/likes', {})
 }
 
+export function advanceChannelPlayback(ideaId: number, startedAt: number) {
+  return postJson<ChannelSnapshot>('/api/playback/advance', { ideaId, startedAt })
+}
+
 export async function loadOlderChat(before: number, limit = 100, signal?: AbortSignal) {
   const query = new URLSearchParams({ before: String(before), limit: String(limit) })
   const response = await fetch(`/api/chat?${query.toString()}`, {
@@ -189,5 +193,5 @@ export function useChannel() {
     }
   }, [refresh])
 
-  return { snapshot, connection, error, refresh, applyLikes }
+  return { snapshot, connection, error, refresh, applyLikes, applySnapshot }
 }

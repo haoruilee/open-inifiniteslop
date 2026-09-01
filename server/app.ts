@@ -43,6 +43,10 @@ const compatibilityVoteSchema = z.object({
 }).strict()
 const likeSchema = z.object({}).strict()
 const compatibilityLikeSchema = z.object({ seg: z.string().max(128).optional() }).strict()
+const playbackAdvanceSchema = z.object({
+  ideaId: z.coerce.number().int().positive(),
+  startedAt: z.coerce.number().int().positive(),
+}).strict()
 const moderationSchema = z.object({
   action: z.enum(['approve', 'reject']),
   reason: z.string().trim().min(1).max(160).optional(),
@@ -350,7 +354,7 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
       const visitorId = isApi ? visitorSession(request, response, config.secureCookies) : ''
       const ip = remoteAddress(request, config.trustProxy)
 
-      const limit = (scope: 'prompt' | 'vote' | 'like', maximum: number) => {
+      const limit = (scope: 'prompt' | 'vote' | 'like' | 'playback', maximum: number) => {
         const result = limiter.take(`${scope}:${ip}:${visitorId}`, maximum)
         if (result.allowed) return
         response.setHeader('Retry-After', String(result.retryAfterSeconds))
@@ -435,6 +439,14 @@ export function createChannelHttpApp(database: ChannelDatabase, config: RuntimeC
       }
 
       if (method === 'POST') requireSameOrigin(request)
+
+      if (method === 'POST' && pathname === '/api/playback/advance') {
+        limit('playback', 30)
+        const result = database.advancePlayback(validate(playbackAdvanceSchema, await readJson(request)))
+        if (result.changed) broadcast()
+        json(response, 200, snapshot())
+        return
+      }
 
       if (method === 'POST' && (pathname === '/api/prompts' || pathname === '/api/chat')) {
         limit('prompt', config.promptRateLimit)

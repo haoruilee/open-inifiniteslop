@@ -585,7 +585,7 @@ export class ChannelDatabase {
     }
   }
 
-  advancePlayback() {
+  advancePlayback(force?: { ideaId: number; startedAt: number }) {
     const now = this.now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -598,7 +598,13 @@ export class ChannelDatabase {
 
       let needsNext = !current
       let justAiredId: number | null = null
-      if (current && now - Number(current.status_changed_at) >= Number(current.duration_seconds) * 1_000) {
+      const forceMatchesCurrent = Boolean(
+        force
+        && current
+        && Number(current.id) === force.ideaId
+        && Number(current.status_changed_at) === force.startedAt,
+      )
+      if (current && (forceMatchesCurrent || now - Number(current.status_changed_at) >= Number(current.duration_seconds) * 1_000)) {
         this.db.prepare(`
           UPDATE ideas SET status = 'aired', status_changed_at = ? WHERE id = ? AND status = 'playing'
         `).run(now, current.id)
