@@ -2,6 +2,18 @@ import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
 import { channelBotPromptFor } from './channel-bot-prompts.js'
 import { mp4DurationSeconds } from './mp4-duration.js'
 import { requiresOrangeGatewayAuth } from './orange-media.js'
+import {
+  isSeoRoute,
+  isTechnicalNoindexPath,
+  renderAboutPage,
+  renderArchivePage,
+  renderFeed,
+  renderNotFoundPage,
+  renderSitemap,
+  renderVideoThumbnail,
+  renderWatchPage,
+  type SeoVideo,
+} from './seo.js'
 
 type WorkerEnv = Env & {
   ORANGE_API_KEY?: string
@@ -45,6 +57,11 @@ type IdeaRow = {
   generation_poll_lease_until: number | null
   generation_poll_token: string | null
 }
+
+type SeoIdeaRow = Pick<
+  IdeaRow,
+  'id' | 'body' | 'created_at' | 'status_changed_at' | 'duration_seconds'
+>
 
 type PublicIdea = {
   id: number
@@ -324,9 +341,10 @@ function securityHeaders(headers: Headers, requestId: string) {
   )
 }
 
-function finalize(response: Response, context: RequestContext) {
+function finalize(response: Response, context: RequestContext, noindex = false) {
   const headers = new Headers(response.headers)
   securityHeaders(headers, context.requestId)
+  if (noindex) headers.set('X-Robots-Tag', 'noindex')
   if (context.setCookie) headers.append('Set-Cookie', context.setCookie)
   return new Response(response.body, {
     status: response.status,
@@ -372,7 +390,7 @@ function parseCookies(header: string | null) {
   return cookies
 }
 
-function requestContext(request: Request): RequestContext {
+function requestContext(request: Request, includeVisitor = true): RequestContext {
   const candidate = parseCookies(request.headers.get('Cookie')).get('islop_vid')
   const visitorId = candidate && /^[0-9a-f-]{36}$/iu.test(candidate)
     ? candidate
@@ -380,7 +398,7 @@ function requestContext(request: Request): RequestContext {
   return {
     requestId: crypto.randomUUID(),
     visitorId,
-    setCookie: candidate === visitorId
+    setCookie: !includeVisitor || candidate === visitorId
       ? null
       : `islop_vid=${encodeURIComponent(visitorId)}; HttpOnly;${new URL(request.url).protocol === 'https:' ? ' Secure;' : ''} SameSite=Strict; Path=/; Max-Age=31536000`,
     ip: request.headers.get('CF-Connecting-IP') || 'unknown',
@@ -651,6 +669,149 @@ function toModerationIdea(row: IdeaRow) {
 async function rows<T>(statement: D1PreparedStatement) {
   const result = await statement.all<T>()
   return result.results
+}
+
+const seoArchivePageSize = 50
+const maximumSeoArchivePages = 20
+
+function toSeoVideo(row: SeoIdeaRow): SeoVideo {
+  const duration = row.duration_seconds === null ? null : Number(row.duration_seconds)
+  return {
+    id: Number(row.id),
+    body: row.body,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.status_changed_at),
+    durationSeconds: duration !== null && Number.isFinite(duration) && duration > 0 ? duration : null,
+  }
+}
+
+async function seoVideoRows(env: WorkerEnv, limit: number, offset = 0) {
+  const records = await rows<SeoIdeaRow>(env.DB.prepare(`
+    SELECT id, body, created_at, status_changed_at, duration_seconds
+    FROM ideas
+    WHERE status IN ('ready', 'playing', 'aired') AND video_key IS NOT NULL
+    ORDER BY status_changed_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset))
+  return records.map(toSeoVideo)
+}
+
+async function seoVideoById(env: WorkerEnv, id: number) {
+  const record = await env.DB.prepare(`
+    SELECT id, body, created_at, status_changed_at, duration_seconds
+    FROM ideas
+    WHERE id = ?
+      AND status IN ('ready', 'playing', 'aired')
+      AND video_key IS NOT NULL
+  `).bind(id).first<SeoIdeaRow>()
+  return record ? toSeoVideo(record) : null
+}
+
+function seoResponse(
+  request: Request,
+  body: string,
+  contentType: string,
+  status = 200,
+  cacheControl = 'public, max-age=900, s-maxage=900, stale-while-revalidate=86400',
+) {
+  return new Response(request.method === 'HEAD' ? null : body, {
+    status,
+    headers: {
+      'Content-Type': contentType,
+      'Cache-Control': cacheControl,
+    },
+  })
+}
+
+function seoNotFound(request: Request) {
+  return seoResponse(
+    request,
+    renderNotFoundPage(),
+    'text/html; charset=utf-8',
+    404,
+    'no-store',
+  )
+}
+
+function pathVideoId(value: string) {
+  const id = Number(value)
+  return Number.isSafeInteger(id) && id > 0 ? id : null
+}
+
+async function handleSeo(request: Request, env: WorkerEnv) {
+  const url = new URL(request.url)
+  const { pathname } = url
+  if (!isSeoRoute(pathname)) return null
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response(null, {
+      status: 405,
+      headers: { Allow: 'GET, HEAD', 'Cache-Control': 'no-store' },
+    })
+  }
+
+  const archiveLimit = configuredArchiveLimit(env)
+  if (pathname === '/sitemap.xml') {
+    const videos = await seoVideoRows(env, archiveLimit)
+    return seoResponse(
+      request,
+      renderSitemap(videos),
+      'application/xml; charset=utf-8',
+      200,
+      'public, max-age=900, s-maxage=900, stale-while-revalidate=86400',
+    )
+  }
+  if (pathname === '/feed.xml') {
+    const videos = await seoVideoRows(env, Math.min(50, archiveLimit))
+    return seoResponse(
+      request,
+      renderFeed(videos),
+      'application/rss+xml; charset=utf-8',
+      200,
+      'public, max-age=900, s-maxage=900, stale-while-revalidate=86400',
+    )
+  }
+  if (pathname === '/about' || pathname === '/about/') {
+    return seoResponse(
+      request,
+      renderAboutPage(),
+      'text/html; charset=utf-8',
+      200,
+      'public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400',
+    )
+  }
+  if (pathname === '/archive' || pathname === '/archive/') {
+    const rawPage = url.searchParams.get('page')
+    const page = rawPage && /^\d+$/u.test(rawPage) ? Number(rawPage) : 1
+    if (!Number.isSafeInteger(page) || page < 1 || page > maximumSeoArchivePages) return seoNotFound(request)
+    const offset = (page - 1) * seoArchivePageSize
+    if (offset >= archiveLimit) return seoNotFound(request)
+    const videos = await seoVideoRows(env, Math.min(seoArchivePageSize + 1, archiveLimit - offset), offset)
+    if (page > 1 && videos.length === 0) return seoNotFound(request)
+    return seoResponse(request, renderArchivePage(videos.slice(0, seoArchivePageSize), page, videos.length > seoArchivePageSize), 'text/html; charset=utf-8')
+  }
+
+  const thumbnailMatch = pathname.match(/^\/watch\/(\d+)\/thumbnail\.svg\/?$/u)
+  if (thumbnailMatch) {
+    const id = pathVideoId(thumbnailMatch[1])
+    const video = id === null ? null : await seoVideoById(env, id)
+    if (!video) return seoNotFound(request)
+    return seoResponse(
+      request,
+      renderVideoThumbnail(video),
+      'image/svg+xml; charset=utf-8',
+      200,
+      'public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400',
+    )
+  }
+  const watchMatch = pathname.match(/^\/watch\/(\d+)\/?$/u)
+  if (watchMatch) {
+    const id = pathVideoId(watchMatch[1])
+    const video = id === null ? null : await seoVideoById(env, id)
+    return video
+      ? seoResponse(request, renderWatchPage(video), 'text/html; charset=utf-8')
+      : seoNotFound(request)
+  }
+  return null
 }
 
 async function replayCandidates(env: WorkerEnv, limit: number) {
@@ -1501,22 +1662,25 @@ function orangeHeaders(env: WorkerEnv, includeJson = false) {
 
 const worker: ExportedHandler<WorkerEnv> = {
   async fetch(request, env, execution) {
-    const context = requestContext(request)
+    const pathname = new URL(request.url).pathname
+    const isApi = pathname.startsWith('/api/') || pathname === '/status.json'
+    const statelessRequest = isSeoRoute(pathname) || pathname.startsWith('/api/media/')
+    const context = requestContext(request, !statelessRequest)
+    const noindex = isTechnicalNoindexPath(pathname)
     try {
-      const pathname = new URL(request.url).pathname
-      const isApi = pathname.startsWith('/api/') || pathname === '/status.json'
+      const seo = isApi ? null : await handleSeo(request, env)
       const response = isApi
         ? await handleApi(request, env, context, execution)
-        : await env.ASSETS.fetch(request)
-      return finalize(response, context)
+        : seo ?? await env.ASSETS.fetch(request)
+      return finalize(response, context, noindex)
     } catch (error) {
-      if (error instanceof HttpError) return finalize(errorResponse(error), context)
+      if (error instanceof HttpError) return finalize(errorResponse(error), context, noindex)
       console.error(JSON.stringify({
         event: 'request_failed',
         requestId: context.requestId,
         error: error instanceof Error ? error.name : 'UnknownError',
       }))
-      return finalize(errorResponse(new HttpError(500, 'INTERNAL_ERROR', 'Internal server error')), context)
+      return finalize(errorResponse(new HttpError(500, 'INTERNAL_ERROR', 'Internal server error')), context, noindex)
     }
   },
   async scheduled(_controller, env, execution) {
