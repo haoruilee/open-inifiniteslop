@@ -21,6 +21,16 @@ type FeedItem = {
   automated?: boolean
 }
 
+type PlaybackSlot = 'a' | 'b'
+
+function playbackIdentity(idea: ChannelIdea | null | undefined) {
+  return idea ? `${idea.id}:${idea.startedAt ?? 'pending'}` : null
+}
+
+function alternateSlot(slot: PlaybackSlot): PlaybackSlot {
+  return slot === 'a' ? 'b' : 'a'
+}
+
 function toFeedItem(idea: ChannelIdea, nickname: string): FeedItem {
   return {
     id: idea.id,
@@ -346,11 +356,16 @@ function App() {
   const [hasOlderChat, setHasOlderChat] = useState(false)
   const [loadingOlderChat, setLoadingOlderChat] = useState(false)
   const noticeTimer = useRef<number | null>(null)
-  const videoRef = useRef<HTMLVideoElement>(null)
+  const videoARef = useRef<HTMLVideoElement>(null)
+  const videoBRef = useRef<HTMLVideoElement>(null)
   const chatHistoryExhausted = useRef(false)
   const endedPlaybackKey = useRef<string | null>(null)
   const playbackRetryTimers = useRef<number[]>([])
   const playbackAdvanceInFlight = useRef<string | null>(null)
+  const activeSlotRef = useRef<PlaybackSlot>('a')
+  const slotPlaybackRef = useRef<Record<PlaybackSlot, ChannelIdea | null>>({ a: null, b: null })
+  const [activeSlot, setActiveSlot] = useState<PlaybackSlot>('a')
+  const [slotPlayback, setSlotPlayback] = useState<Record<PlaybackSlot, ChannelIdea | null>>({ a: null, b: null })
 
   const chatIdeas = useMemo(() => {
     const latest = snapshot?.chat ?? []
@@ -364,10 +379,15 @@ function App() {
   const generatingNow = useMemo(() => (snapshot?.generatingNow ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.generatingNow, nickname])
   const queue = useMemo(() => (snapshot?.queue ?? []).map((idea) => toFeedItem(idea, nickname)), [snapshot?.queue, nickname])
   const nowPlaying = snapshot?.nowPlaying
-  const nowPlayingKey = nowPlaying ? `${nowPlaying.id}:${nowPlaying.startedAt ?? 'pending'}` : null
-  const preloadedVideo = snapshot?.playingNext.find((idea) => (
-    Boolean(idea.videoUrl) && idea.id !== nowPlaying?.id
-  ))
+  const nowPlayingKey = playbackIdentity(nowPlaying)
+
+  useEffect(() => {
+    activeSlotRef.current = activeSlot
+  }, [activeSlot])
+
+  useEffect(() => {
+    slotPlaybackRef.current = slotPlayback
+  }, [slotPlayback])
 
   useEffect(() => {
     const first = snapshot?.chat[0]?.id ?? null
@@ -523,9 +543,10 @@ function App() {
 
   function tuneIn() {
     setTunedIn(true)
-    if (videoRef.current) {
-      videoRef.current.muted = false
-      void videoRef.current.play().catch(() => undefined)
+    const activeVideo = activeSlotRef.current === 'a' ? videoARef.current : videoBRef.current
+    if (activeVideo) {
+      activeVideo.muted = false
+      void activeVideo.play().catch(() => undefined)
     }
   }
 
@@ -535,6 +556,12 @@ function App() {
   const nowTime = nowPlaying?.time || '--:--'
   const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
   const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
+  const activePlayback = slotPlayback[activeSlot] ?? (showVideo ? nowPlaying : null)
+  const slotAPlayback = slotPlayback.a ?? (activeSlot === 'a' && showVideo ? nowPlaying : null)
+  const slotBPlayback = slotPlayback.b ?? (activeSlot === 'b' && showVideo ? nowPlaying : null)
+  const videoForSlot = useCallback((slot: PlaybackSlot) => (
+    slot === 'a' ? videoARef.current : videoBRef.current
+  ), [])
 
   const requestPlaybackAdvance = useCallback(async () => {
     const playback = nowPlaying
@@ -570,75 +597,159 @@ function App() {
     }
   }, [clearPlaybackRetries, nowPlayingKey, requestPlaybackAdvance])
 
-  useEffect(() => {
-    const video = videoRef.current
-    if (!video || !showVideo) return
+  const playSlot = useCallback((slot: PlaybackSlot) => {
+    const video = videoForSlot(slot)
+    if (!video) return
 
-    const startPlayback = () => {
-      // A fresh video element with sound can be autoplay-blocked after each
-      // carousel handoff. Start muted, then restore sound only after playback
-      // has actually started.
-      video.muted = true
-      void video.play().then(() => {
-        if (video.isConnected && tunedIn) video.muted = false
-      }).catch(() => {
+    // A new element must start muted or browsers can reject the automatic
+    // handoff. Audio is restored only after its first successful frame.
+    video.muted = true
+    void video.play().then(() => {
+      if (video.isConnected && activeSlotRef.current === slot && tunedIn) video.muted = false
+    }).catch(() => {
+      if (playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey) {
         void requestPlaybackAdvance()
-      })
-    }
+      }
+    })
+  }, [nowPlayingKey, requestPlaybackAdvance, tunedIn, videoForSlot])
 
+  const promoteSlot = useCallback((slot: PlaybackSlot) => {
+    const source = slotPlaybackRef.current[slot]
+    const video = videoForSlot(slot)
+    if (
+      !source
+      || playbackIdentity(source) !== nowPlayingKey
+      || !video
+      || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+    ) return
+
+    const previousSlot = activeSlotRef.current
+    if (previousSlot !== slot) {
+      if (video.currentTime > 0) video.currentTime = 0
+      activeSlotRef.current = slot
+      setActiveSlot(slot)
+      window.setTimeout(() => {
+        if (activeSlotRef.current === slot) videoForSlot(previousSlot)?.pause()
+      }, 360)
+    }
+    playSlot(slot)
+  }, [nowPlayingKey, playSlot, videoForSlot])
+
+  const handleCanPlay = useCallback((slot: PlaybackSlot) => {
+    if (slot === activeSlotRef.current) {
+      playSlot(slot)
+      return
+    }
+    if (playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey) promoteSlot(slot)
+  }, [nowPlayingKey, playSlot, promoteSlot])
+
+  const handleVideoFailure = useCallback((slot: PlaybackSlot) => {
+    const source = slotPlaybackRef.current[slot]
+    if (!source || playbackIdentity(source) !== nowPlayingKey) return
+    setFailedVideoId(source.id)
+    void requestPlaybackAdvance()
+  }, [nowPlayingKey, requestPlaybackAdvance])
+
+  const handleVideoProgress = useCallback((slot: PlaybackSlot) => {
+    if (slot !== activeSlotRef.current) return
+    const source = slotPlaybackRef.current[slot]
+    const video = videoForSlot(slot)
+    if (
+      !source
+      || playbackIdentity(source) !== nowPlayingKey
+      || !video
+      || !Number.isFinite(video.duration)
+      || video.duration <= 0
+    ) return
+    if (video.currentTime >= video.duration - 0.35) handleVideoEnded()
+  }, [handleVideoEnded, nowPlayingKey, videoForSlot])
+
+  useEffect(() => {
+    if (!showVideo || !nowPlaying || !nowPlayingKey) return
+    const currentSlot = activeSlotRef.current
+    const current = slotPlaybackRef.current[currentSlot]
+    const destination = !current
+      ? currentSlot
+      : playbackIdentity(current) === nowPlayingKey
+        ? null
+        : alternateSlot(currentSlot)
+    if (!destination || playbackIdentity(slotPlaybackRef.current[destination]) === nowPlayingKey) return
+
+    setSlotPlayback((existing) => {
+      const next = { ...existing, [destination]: nowPlaying }
+      slotPlaybackRef.current = next
+      return next
+    })
+  }, [nowPlaying, nowPlayingKey, showVideo])
+
+  useEffect(() => {
+    const video = videoForSlot(activeSlot)
+    if (!video || !activePlayback?.videoUrl) return
+
+    const startPlayback = () => playSlot(activeSlot)
     video.addEventListener('canplay', startPlayback)
     const timer = window.setTimeout(startPlayback, 0)
     return () => {
       video.removeEventListener('canplay', startPlayback)
       window.clearTimeout(timer)
     }
-  }, [nowPlaying?.id, nowPlaying?.startedAt, nowPlaying?.videoUrl, requestPlaybackAdvance, showVideo, tunedIn])
+  }, [activePlayback?.id, activePlayback?.startedAt, activePlayback?.videoUrl, activeSlot, playSlot, videoForSlot])
 
   useEffect(() => {
-    const video = videoRef.current
-    if (!video || !showVideo || !nowPlayingKey) return
+    if (!showVideo || !nowPlayingKey) return
 
     const watchdog = window.setTimeout(() => {
       if (document.visibilityState !== 'visible') return
-      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.paused) {
+      const targetSlot = (['a', 'b'] as PlaybackSlot[]).find((slot) => (
+        playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey
+      ))
+      const video = targetSlot ? videoForSlot(targetSlot) : null
+      if (!targetSlot || !video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
         void requestPlaybackAdvance()
+      } else if (targetSlot === activeSlotRef.current && video.paused) {
+        playSlot(targetSlot)
+      } else if (targetSlot !== activeSlotRef.current) {
+        promoteSlot(targetSlot)
       }
     }, 8_000)
 
     return () => window.clearTimeout(watchdog)
-  }, [nowPlayingKey, requestPlaybackAdvance, showVideo])
+  }, [nowPlayingKey, playSlot, promoteSlot, requestPlaybackAdvance, showVideo, slotPlayback, videoForSlot])
 
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
       <div className={`tv-wrap ${tunedIn ? 'playing' : ''}`}>
         <img className="video-frame video-poster" src={poster} alt="Surreal AI-generated television broadcast" />
-        {showVideo ? (
+        {slotAPlayback?.videoUrl ? (
           <video
-            key={`${nowPlaying?.id}:${nowPlaying?.startedAt}:${nowPlaying?.videoUrl}`}
-            ref={videoRef}
-            className="video-frame broadcast-video"
-            src={nowPlaying?.videoUrl || undefined}
-            poster={poster}
-            autoPlay
+            ref={videoARef}
+            className={`video-frame broadcast-video ${activeSlot === 'a' ? 'is-active' : ''}`}
+            src={slotAPlayback.videoUrl}
+            poster={slotAPlayback.posterUrl || poster}
             muted
             playsInline
+            loop
             preload="auto"
-            onError={() => {
-              setFailedVideoId(nowPlaying?.id ?? null)
-              void requestPlaybackAdvance()
-            }}
+            onCanPlay={() => handleCanPlay('a')}
+            onError={() => handleVideoFailure('a')}
+            onTimeUpdate={() => handleVideoProgress('a')}
             onEnded={handleVideoEnded}
           />
         ) : null}
-        {preloadedVideo?.videoUrl ? (
+        {slotBPlayback?.videoUrl ? (
           <video
-            className="video-preloader"
-            src={preloadedVideo.videoUrl}
+            ref={videoBRef}
+            className={`video-frame broadcast-video ${activeSlot === 'b' ? 'is-active' : ''}`}
+            src={slotBPlayback.videoUrl}
+            poster={slotBPlayback.posterUrl || poster}
             muted
             playsInline
+            loop
             preload="auto"
-            aria-hidden="true"
-            tabIndex={-1}
+            onCanPlay={() => handleCanPlay('b')}
+            onError={() => handleVideoFailure('b')}
+            onTimeUpdate={() => handleVideoProgress('b')}
+            onEnded={handleVideoEnded}
           />
         ) : null}
       </div>

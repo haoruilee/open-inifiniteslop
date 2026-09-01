@@ -93,16 +93,12 @@ a:focus-visible,
 .broadcast-video {
   z-index: 1;
   background: #000;
+  opacity: 0;
+  transition: opacity .32s ease, filter .35s ease;
 }
 
-.video-preloader {
-  position: fixed;
-  top: -2px;
-  left: -2px;
-  width: 1px;
-  height: 1px;
-  opacity: .001;
-  pointer-events: none;
+.broadcast-video.is-active {
+  opacity: 1;
 }
 
 .tv-wrap.playing .video-frame {
