@@ -646,7 +646,7 @@ function toPublicIdea(row: IdeaRow): PublicIdea {
     createdAt: Number(row.created_at),
     time: formatClock(Number(row.created_at)),
     videoUrl: row.video_key ? `/api/media/${row.id}` : null,
-    posterUrl: row.poster_url,
+    posterUrl: row.poster_url === '/assets/tv-frame.png' ? '/assets/tv-frame.webp' : row.poster_url,
     durationSeconds: row.duration_seconds === null ? null : Number(row.duration_seconds),
     generationProgress: row.generation_progress,
     startedAt: row.status === 'playing' ? Number(row.status_changed_at) : null,
@@ -1149,7 +1149,7 @@ async function storeCompletedVideo(env: WorkerEnv, claim: GenerationPollClaim, r
   const now = Date.now()
   const published = await env.DB.prepare(`
     UPDATE ideas
-    SET status = 'ready', status_changed_at = ?, video_key = ?, poster_url = '/assets/tv-frame.png',
+    SET status = 'ready', status_changed_at = ?, video_key = ?, poster_url = '/assets/tv-frame.webp',
         duration_seconds = ?, generation_progress = 'complete', error = NULL,
         generation_next_poll_at = NULL, generation_poll_lease_until = NULL, generation_poll_token = NULL
     WHERE id = ? AND status = 'generating' AND generation_poll_token = ?

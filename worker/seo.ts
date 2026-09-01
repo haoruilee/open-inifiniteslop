@@ -107,10 +107,10 @@ function siteFooter() {
 
 function documentPage(options: PageOptions, origin = seoOrigin) {
   const canonical = pageUrl(options.canonicalPath, origin)
-  const image = pageUrl(options.imagePath || '/assets/ai4azure-avatar.png', origin)
-  const imageWidth = options.imageWidth || 256
-  const imageHeight = options.imageHeight || 256
-  const twitterCard = options.imageWidth && options.imageWidth >= 1_000 ? 'summary_large_image' : 'summary'
+  const image = pageUrl(options.imagePath || '/assets/og-card.webp', origin)
+  const imageWidth = options.imageWidth || 1200
+  const imageHeight = options.imageHeight || 630
+  const twitterCard = imageWidth >= 1_000 ? 'summary_large_image' : 'summary'
   const schema = options.schema ? `<script type="application/ld+json">${jsonForScript(options.schema)}</script>` : ''
   const videoMeta = options.videoPath ? `<meta property="og:video" content="${escapeHtml(pageUrl(options.videoPath, origin))}" />
     <meta property="og:video:type" content="video/mp4" />` : ''

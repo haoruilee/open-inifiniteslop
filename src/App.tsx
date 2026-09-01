@@ -31,6 +31,12 @@ function alternateSlot(slot: PlaybackSlot): PlaybackSlot {
   return slot === 'a' ? 'b' : 'a'
 }
 
+function optimizedPoster(posterUrl: string | null | undefined) {
+  return !posterUrl || posterUrl === '/assets/tv-frame.png'
+    ? '/assets/tv-frame.webp'
+    : posterUrl
+}
+
 function toFeedItem(idea: ChannelIdea, nickname: string): FeedItem {
   return {
     id: idea.id,
@@ -558,7 +564,7 @@ function App() {
   const nowMessage = nowPlaying?.message || 'the next broadcast is warming up'
   const nowUser = nowPlaying?.user || 'channel'
   const nowTime = nowPlaying?.time || '--:--'
-  const poster = nowPlaying?.posterUrl || '/assets/tv-frame.png'
+  const poster = optimizedPoster(nowPlaying?.posterUrl)
   const showVideo = Boolean(nowPlaying?.videoUrl && failedVideoId !== nowPlaying.id)
   const activePlayback = slotPlayback[activeSlot] ?? (showVideo ? nowPlaying : null)
   const slotAPlayback = slotPlayback.a ?? (activeSlot === 'a' && showVideo ? nowPlaying : null)
@@ -726,13 +732,20 @@ function App() {
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
       <h1 className="sr-only">Infinite AI Slop: a live community-shaped AI video channel</h1>
       <div className={`tv-wrap ${tunedIn ? 'playing' : ''}`}>
-        <img className="video-frame video-poster" src={poster} alt="Surreal AI-generated television broadcast" />
+        <img
+          className="video-frame video-poster"
+          src={poster}
+          alt="Surreal AI-generated television broadcast"
+          width={941}
+          height={1672}
+          fetchPriority="high"
+        />
         {slotAPlayback?.videoUrl ? (
           <video
             ref={videoARef}
             className={`video-frame broadcast-video ${activeSlot === 'a' ? 'is-active' : ''}`}
             src={slotAPlayback.videoUrl}
-            poster={slotAPlayback.posterUrl || poster}
+            poster={optimizedPoster(slotAPlayback.posterUrl)}
             muted
             playsInline
             loop
@@ -748,7 +761,7 @@ function App() {
             ref={videoBRef}
             className={`video-frame broadcast-video ${activeSlot === 'b' ? 'is-active' : ''}`}
             src={slotBPlayback.videoUrl}
-            poster={slotBPlayback.posterUrl || poster}
+            poster={optimizedPoster(slotBPlayback.posterUrl)}
             muted
             playsInline
             loop
