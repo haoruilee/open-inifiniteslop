@@ -1,4 +1,5 @@
 import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
+import { channelBotPromptFor } from './channel-bot-prompts.js'
 import { mp4DurationSeconds } from './mp4-duration.js'
 import { requiresOrangeGatewayAuth } from './orange-media.js'
 
@@ -106,12 +107,13 @@ type PlaybackAdvanceRequest = {
 
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
-const defaultArchiveLimit = 300
-const defaultPlaybackRecencyWindow = 24
+const defaultArchiveLimit = 500
+const defaultPlaybackRecencyWindow = 48
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
 const defaultChannelBotIntervalMinutes = 10
+const defaultChannelBotQueueTarget = 1
 const defaultTextPolishBase = 'https://ai-cpa-cf.nullatoms.com/v1'
 const defaultTextPolishModel = 'gpt-5.4-mini'
 const textPolishSystemPrompt = [
@@ -128,32 +130,6 @@ const generationPollLeaseMs = 5 * 60_000
 const maximumGenerationPollsPerTick = 8
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
-const channelBotPrompts = [
-  'A miniature night train crossing a glowing paper landscape, gentle camera drift, cinematic, no text.',
-  'A tiny radio tower on a floating island sending music into a pink dawn sky, dreamy cinematic light, no text.',
-  'A jellyfish-shaped lantern drifting through a quiet underwater library, soft bioluminescence, no text.',
-  'A small orange robot watering a rooftop garden after rain, warm reflections, cinematic, no text.',
-  'A moonlit carousel made of clouds turning slowly above a sleeping city, magical realism, no text.',
-  'A tiny sailboat sailing through a field of blue flowers at sunrise, calm cinematic movement, no text.',
-  'A cozy bookstore inside a moving tram, golden afternoon light and drifting dust, no text.',
-  'A friendly robot DJ mixing records beneath an aurora, playful neon light, no text.',
-  'A glass elevator travelling slowly through a vertical garden inside a cloud, warm afternoon glow, no text.',
-  'A small observatory on a snowy hill as constellations wake up overhead, cinematic, no text.',
-  'A glowing vending machine in a rainy alley serving tiny planets, calm camera move, no text.',
-  'A paper dragon flying above a quiet seaside town at sunset, soft cinematic light, no text.',
-  'A tea shop run by small woodland robots in a mossy forest, cozy cinematic scene, no text.',
-  'A neon sign painter working atop a high-rise balcony in gentle rain, atmospheric, no text.',
-  'A tiny astronaut tending a greenhouse on the moon, slow peaceful movement, no text.',
-  'A whale-shaped airship floating between pink mountains at dawn, dreamy cinematic, no text.',
-  'A golden retriever in a yellow raincoat walking through a miniature city made of flowers, no text.',
-  'A street musician playing under floating lanterns in a quiet night market, soft cinematic light, no text.',
-  'A futuristic laundromat where washing machines contain tiny thunderstorms, playful, no text.',
-  'A small red tram gliding through an autumn forest filled with fireflies, cinematic, no text.',
-  'A sunflower field growing on the roof of a moving train, sunny and surreal, no text.',
-  'A robot chef preparing noodles in a tiny kitchen inside a lighthouse, warm cozy light, no text.',
-  'A transparent submarine passing through an underwater city of coral towers, gentle drift, no text.',
-  'A quiet record store on a floating platform above the ocean at blue hour, cinematic, no text.',
-] as const
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -320,9 +296,13 @@ function configuredChannelBotIntervalMs(env: WorkerEnv) {
   return boundedEnvNumber(
     env.CHANNEL_BOT_INTERVAL_MINUTES,
     defaultChannelBotIntervalMinutes,
-    5,
+    1,
     24 * 60,
   ) * 60_000
+}
+
+function configuredChannelBotQueueTarget(env: WorkerEnv) {
+  return boundedEnvNumber(env.CHANNEL_BOT_QUEUE_TARGET, defaultChannelBotQueueTarget, 1, 32)
 }
 
 function securityHeaders(headers: Headers, requestId: string) {
@@ -508,42 +488,54 @@ async function upsertVisitor(env: WorkerEnv, visitorId: string, now: number) {
   `).bind(visitorId, now, now).run()
 }
 
-async function queueChannelBotPrompt(env: WorkerEnv) {
+async function queueChannelBotPrompts(env: WorkerEnv) {
   if (!channelBotEnabled(env)) return false
 
   const now = Date.now()
   const intervalMs = configuredChannelBotIntervalMs(env)
-  const prompt = channelBotPrompts[Math.floor(now / intervalMs) % channelBotPrompts.length]
-  const moderation = moderatePrompt(prompt)
-  if (moderation.decision !== 'approve') {
-    console.error(JSON.stringify({ event: 'channel_bot_prompt_not_approved', reason: moderation.reason }))
-    return false
-  }
-
   await upsertVisitor(env, channelBotVisitorId, now)
-  const inserted = await env.DB.prepare(`
-    INSERT INTO ideas(
-      visitor_id, author, body, normalized_body, status, moderation_reason,
-      created_at, status_changed_at
-    )
-    SELECT ?, ?, ?, ?, 'queued', 'automated_channel_bot', ?, ?
-    WHERE NOT EXISTS (
-      SELECT 1 FROM ideas
-      WHERE visitor_id = ? AND created_at >= ? AND status != 'rejected'
-    )
-  `).bind(
-    channelBotVisitorId,
-    channelBotAuthor,
-    prompt,
-    normalizePrompt(prompt).toLocaleLowerCase('en'),
-    now,
-    now,
-    channelBotVisitorId,
-    now - intervalMs,
-  ).run()
-  if (Number(inserted.meta.changes ?? 0) === 0) return false
-  await bumpRevision(env, now)
-  return true
+  const inFlight = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM ideas
+    WHERE visitor_id = ? AND status IN ('queued', 'generating', 'ready', 'playing')
+  `).bind(channelBotVisitorId).first<{ count: number }>()
+  const target = configuredChannelBotQueueTarget(env)
+  const missing = Math.max(0, target - Number(inFlight?.count ?? 0))
+  if (missing === 0) return false
+
+  const slotBase = Math.floor(now / intervalMs) * target
+  let created = 0
+  for (let offset = 0; offset < missing; offset += 1) {
+    const prompt = channelBotPromptFor(slotBase + offset)
+    const moderation = moderatePrompt(prompt)
+    if (moderation.decision !== 'approve') {
+      console.error(JSON.stringify({ event: 'channel_bot_prompt_not_approved', reason: moderation.reason }))
+      continue
+    }
+
+    const inserted = await env.DB.prepare(`
+      INSERT INTO ideas(
+        visitor_id, author, body, normalized_body, status, moderation_reason,
+        created_at, status_changed_at
+      )
+      SELECT ?, ?, ?, ?, 'queued', 'automated_channel_bot', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ideas
+        WHERE visitor_id = ? AND normalized_body = ? AND status != 'rejected'
+      )
+    `).bind(
+      channelBotVisitorId,
+      channelBotAuthor,
+      prompt,
+      normalizePrompt(prompt).toLocaleLowerCase('en'),
+      now,
+      now,
+      channelBotVisitorId,
+      normalizePrompt(prompt).toLocaleLowerCase('en'),
+    ).run()
+    created += Number(inserted.meta.changes ?? 0)
+  }
+  if (created > 0) await bumpRevision(env, now)
+  return created > 0
 }
 
 async function hashSubject(scope: string, subject: string) {
@@ -1492,7 +1484,7 @@ const worker: ExportedHandler<WorkerEnv> = {
     execution.waitUntil((async () => {
       await reconcileStaleGenerations(env)
       await pollGeneratingTasks(env)
-      await queueChannelBotPrompt(env)
+      await queueChannelBotPrompts(env)
       await advancePlayback(env)
       await dispatchQueued(env)
     })())
