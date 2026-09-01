@@ -128,6 +128,7 @@ const textPolishSystemPrompt = [
 const staleGenerationMs = 30 * 60_000
 const generationPollIntervalMs = 55_000
 const generationPollLeaseMs = 5 * 60_000
+const generationRateLimitBackoffMs = 5 * 60_000
 const maximumGenerationPollsPerTick = 8
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
@@ -750,6 +751,18 @@ async function failGeneration(env: WorkerEnv, ideaId: number, progress: string, 
   if (Number(updated.meta.changes ?? 0) > 0) await bumpRevision(env, now)
 }
 
+async function deferRateLimitedGeneration(env: WorkerEnv, ideaId: number) {
+  const now = Date.now()
+  const updated = await env.DB.prepare(`
+    UPDATE ideas
+    SET status = 'queued', status_changed_at = ?, generation_progress = 'provider_rate_limited',
+        error = 'orange_http_429', generation_next_poll_at = ?, generation_poll_lease_until = NULL,
+        generation_poll_token = NULL
+    WHERE id = ? AND status = 'generating'
+  `).bind(now, now + generationRateLimitBackoffMs, ideaId).run()
+  if (Number(updated.meta.changes ?? 0) > 0) await bumpRevision(env, now)
+}
+
 async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
   const idea = await env.DB.prepare(`
     SELECT id, author, body, provider_request_id, requested_duration_seconds, requested_model
@@ -816,7 +829,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
   } catch (error) {
     if (error instanceof ProviderRateLimitError) {
       await refundGenerationBudget(env, budgetDay)
-      await failGeneration(env, ideaId, 'provider_rate_limited', 'orange_http_429')
+      await deferRateLimitedGeneration(env, ideaId)
       return false
     }
     // No provider-side idempotency key is available.  Treat timeout/connection
@@ -1041,9 +1054,10 @@ async function dispatchQueued(env: WorkerEnv) {
     `).first<{ count: number }>()
     if (Number(count?.count ?? 0) >= target) return
     const next = await env.DB.prepare(`
-      SELECT id FROM ideas WHERE status = 'queued'
+      SELECT id FROM ideas
+      WHERE status = 'queued' AND (generation_next_poll_at IS NULL OR generation_next_poll_at <= ?)
       ORDER BY votes DESC, created_at ASC, id ASC LIMIT 1
-    `).first<{ id: number }>()
+    `).bind(Date.now()).first<{ id: number }>()
     if (!next) return
 
     const now = Date.now()
@@ -1057,7 +1071,7 @@ async function dispatchQueued(env: WorkerEnv) {
     `).bind(now, next.id, concurrentGenerationLimit).run()
     if (Number(claimed.meta.changes ?? 0) === 0) continue
     await bumpRevision(env, now)
-    await submitOrangeTaskOnce(env, next.id)
+    if (!(await submitOrangeTaskOnce(env, next.id))) return
   }
 }
 
