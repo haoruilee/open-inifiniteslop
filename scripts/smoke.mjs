@@ -84,12 +84,30 @@ try {
   assert.equal(home.status, 200)
   assert.match(home.headers.get('content-type') || '', /^text\/html/u)
   const html = await home.text()
-  assert.match(html, /Infinite Slop/u)
+  assert.match(html, /Infinite AI Slop — Live AI Video Channel/u)
+  assert.match(html, /rel="canonical" href="https:\/\/infiniteaislop\.ai\//u)
+  assert.match(html, /property="og:title" content="Infinite AI Slop — Live AI Video Channel"/u)
+  assert.match(html, /application\/ld\+json/u)
   const assetPath = html.match(/(?:src|href)="(\/assets\/[^"/]+-[A-Za-z0-9_-]{8,}\.[^"]+)"/u)?.[1]
   assert.ok(assetPath)
   const asset = await fetch(`${origin}${assetPath}`)
   assert.equal(asset.status, 200)
   assert.match(asset.headers.get('cache-control') || '', /immutable/u)
+
+  const robots = await fetch(`${origin}/robots.txt`)
+  assert.equal(robots.status, 200)
+  assert.match(robots.headers.get('content-type') || '', /^text\/plain/u)
+  assert.match(await robots.text(), /Sitemap: https:\/\/infiniteaislop\.ai\/sitemap\.xml/u)
+
+  const sitemap = await fetch(`${origin}/sitemap.xml`)
+  assert.equal(sitemap.status, 200)
+  assert.match(sitemap.headers.get('content-type') || '', /^application\/xml/u)
+  assert.match(await sitemap.text(), /<loc>https:\/\/infiniteaislop\.ai\/<\/loc>/u)
+
+  const manifest = await fetch(`${origin}/site.webmanifest`)
+  assert.equal(manifest.status, 200)
+  assert.match(manifest.headers.get('content-type') || '', /^application\/manifest\+json/u)
+  assert.equal((await manifest.json()).name, 'Infinite AI Slop')
 
   const initial = await (await fetch(`${origin}/api/state`)).json()
   const marker = `production smoke ${Date.now()}`

@@ -724,6 +724,7 @@ function App() {
 
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
+      <h1 className="sr-only">Infinite AI Slop: a live community-shaped AI video channel</h1>
       <div className={`tv-wrap ${tunedIn ? 'playing' : ''}`}>
         <img className="video-frame video-poster" src={poster} alt="Surreal AI-generated television broadcast" />
         {slotAPlayback?.videoUrl ? (

@@ -14,11 +14,14 @@ const mimeTypes: Record<string, string> = {
   '.mp4': 'video/mp4',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
   '.ttf': 'font/ttf',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.webm': 'video/webm',
   '.webp': 'image/webp',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+  '.xml': 'application/xml; charset=utf-8',
 }
 
 export class StaticRequestError extends Error {
