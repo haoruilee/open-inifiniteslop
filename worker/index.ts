@@ -137,6 +137,8 @@ const defaultDailyGenerationBudget = 100
 const defaultConcurrentGenerationLimit = 4
 const defaultChannelBotIntervalMinutes = 10
 const defaultChannelBotQueueTarget = 1
+const defaultGenerationPollIntervalSeconds = 300
+const defaultQueueSnapshotLimit = 24
 const defaultTextPolishBase = 'https://ai-cpa-cf.nullatoms.com/v1'
 const defaultTextPolishModel = 'gpt-5.4-mini'
 const textPolishSystemPrompt = [
@@ -148,14 +150,14 @@ const textPolishSystemPrompt = [
   'Return only the rewritten prompt and keep it under 700 characters.',
 ].join(' ')
 const staleGenerationMs = 30 * 60_000
-const generationPollIntervalMs = 55_000
-const generationPollLeaseMs = 5 * 60_000
 const generationRateLimitBackoffMs = 5 * 60_000
 const maximumGenerationPollsPerTick = 8
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
 const d1QuotaCircuitKey = 'system/d1-quota-circuit'
 const d1QuotaFallbackSlotMs = 30_000
+const channelBotSlotKey = 'system/channel-bot-slot'
+const stateCacheTtlMs = 8_000
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -193,6 +195,19 @@ function configuredPlaybackRecencyWindow(env: WorkerEnv) {
 
 function configuredChatSnapshotLimit(env: WorkerEnv) {
   return boundedEnvNumber(env.CHAT_SNAPSHOT_LIMIT, defaultChatSnapshotLimit, 10, 100)
+}
+
+function configuredQueueSnapshotLimit(env: WorkerEnv) {
+  return boundedEnvNumber(env.QUEUE_SNAPSHOT_LIMIT, defaultQueueSnapshotLimit, 8, 100)
+}
+
+function configuredGenerationPollIntervalMs(env: WorkerEnv) {
+  return boundedEnvNumber(
+    env.GENERATION_POLL_INTERVAL_SECONDS,
+    defaultGenerationPollIntervalSeconds,
+    60,
+    900,
+  ) * 1_000
 }
 
 function configuredChatPageLimit(env: WorkerEnv) {
@@ -610,19 +625,27 @@ async function queueChannelBotPrompts(env: WorkerEnv) {
 
   const now = Date.now()
   const intervalMs = configuredChannelBotIntervalMs(env)
-  await upsertVisitor(env, channelBotVisitorId, now)
+  const slot = Math.floor(now / intervalMs)
+  const lastSlot = await env.VIDEO_MEDIA.get<number>(channelBotSlotKey, 'json').catch(() => null)
+  if (lastSlot === slot) return false
+
   const inFlight = await env.DB.prepare(`
     SELECT COUNT(*) AS count FROM ideas
     WHERE visitor_id = ? AND status IN ('queued', 'generating', 'ready', 'playing')
   `).bind(channelBotVisitorId).first<{ count: number }>()
   const target = configuredChannelBotQueueTarget(env)
   const missing = Math.max(0, target - Number(inFlight?.count ?? 0))
-  if (missing === 0) return false
+  if (missing === 0) {
+    await env.VIDEO_MEDIA.put(channelBotSlotKey, JSON.stringify(slot), {
+      expirationTtl: Math.max(60, Math.ceil(intervalMs / 1_000) * 3),
+    })
+    return false
+  }
 
-  const slotBase = Math.floor(now / intervalMs) * target
+  await upsertVisitor(env, channelBotVisitorId, now)
   let created = 0
-  for (let offset = 0; offset < missing; offset += 1) {
-    const prompt = channelBotPromptFor(slotBase + offset)
+  for (let offset = 0; offset < Math.min(1, missing); offset += 1) {
+    const prompt = channelBotPromptFor(slot)
     const moderation = moderatePrompt(prompt)
     if (moderation.decision !== 'approve') {
       console.error(JSON.stringify({ event: 'channel_bot_prompt_not_approved', reason: moderation.reason }))
@@ -652,6 +675,9 @@ async function queueChannelBotPrompts(env: WorkerEnv) {
     created += Number(inserted.meta.changes ?? 0)
   }
   if (created > 0) await bumpRevision(env, now)
+  await env.VIDEO_MEDIA.put(channelBotSlotKey, JSON.stringify(slot), {
+    expirationTtl: Math.max(60, Math.ceil(intervalMs / 1_000) * 3),
+  })
   return created > 0
 }
 
@@ -1127,6 +1153,7 @@ async function submitOrangeTaskOnce(env: WorkerEnv, ideaId: number) {
 
 async function claimDueGenerationPolls(env: WorkerEnv) {
   const now = Date.now()
+  const pollIntervalMs = configuredGenerationPollIntervalMs(env)
   const candidates = await rows<{ id: number; provider_request_id: string }>(env.DB.prepare(`
     SELECT id, provider_request_id
     FROM ideas
@@ -1149,8 +1176,8 @@ async function claimDueGenerationPolls(env: WorkerEnv) {
         AND (generation_poll_lease_until IS NULL OR generation_poll_lease_until <= ?)
     `).bind(
       token,
-      now + generationPollLeaseMs,
-      now + generationPollIntervalMs,
+      now + pollIntervalMs + 60_000,
+      now + pollIntervalMs,
       candidate.id,
       candidate.provider_request_id,
       now,
@@ -1170,6 +1197,7 @@ async function releaseGenerationPoll(
   error: string | null,
 ) {
   const now = Date.now()
+  const pollIntervalMs = configuredGenerationPollIntervalMs(env)
   await env.DB.prepare(`
     UPDATE ideas
     SET generation_progress = ?, generation_next_poll_at = ?, generation_poll_lease_until = NULL,
@@ -1177,7 +1205,7 @@ async function releaseGenerationPoll(
     WHERE id = ? AND status = 'generating' AND generation_poll_token = ?
   `).bind(
     progress,
-    now + generationPollIntervalMs,
+    now + pollIntervalMs,
     error ? error.slice(0, 240) : null,
     claim.ideaId,
     claim.token,
@@ -1367,8 +1395,6 @@ async function reconcileStaleGenerations(env: WorkerEnv) {
 }
 
 async function channelSnapshot(env: WorkerEnv): Promise<ChannelSnapshot> {
-  await reconcileStaleGenerations(env)
-  await advancePlayback(env)
   const channel = await env.DB.prepare(`
     SELECT revision, likes, is_live FROM channel_state WHERE singleton = 1
   `).first<{ revision: number; likes: number; is_live: number }>()
@@ -1391,8 +1417,8 @@ async function channelSnapshot(env: WorkerEnv): Promise<ChannelSnapshot> {
   `).bind(playingNextLimit))
   const queue = await rows<IdeaRow>(env.DB.prepare(`
     SELECT * FROM ideas WHERE status = 'queued'
-    ORDER BY votes DESC, created_at ASC, id ASC LIMIT 100
-  `))
+    ORDER BY votes DESC, created_at ASC, id ASC LIMIT ?
+  `).bind(configuredQueueSnapshotLimit(env)))
   const chatLimit = configuredChatSnapshotLimit(env)
   const chatRows = await rows<IdeaRow>(env.DB.prepare(`
     SELECT * FROM (
@@ -1562,6 +1588,53 @@ async function serveFallbackArchiveMedia(request: Request, env: WorkerEnv, seed:
   }))
 }
 
+function channelEtag(revision: number) {
+  return `"channel-${revision}"`
+}
+
+function requestMatchesEtag(request: Request, etag: string) {
+  const requested = request.headers.get('If-None-Match')
+  return requested?.split(',').some((value) => {
+    const candidate = value.trim()
+    return candidate === '*' || candidate === etag
+  }) ?? false
+}
+
+function conditionalStateResponse(request: Request, response: Response) {
+  const etag = response.headers.get('ETag')
+  if (!etag || !requestMatchesEtag(request, etag)) return response
+  const headers = new Headers(response.headers)
+  headers.delete('Content-Length')
+  return new Response(null, { status: 304, headers })
+}
+
+function stateCacheKey(request: Request) {
+  const key = new URL(request.url)
+  key.pathname = '/__edge-cache/channel-state'
+  key.search = `slot=${Math.floor(Date.now() / stateCacheTtlMs)}`
+  return new Request(key.toString(), { method: 'GET' })
+}
+
+async function stateResponse(request: Request, env: WorkerEnv, execution: ExecutionContext) {
+  const key = stateCacheKey(request)
+  const cache = await caches.open('infinite-ai-slop-state')
+  const cached = await cache.match(key)
+  if (cached) return conditionalStateResponse(request, cached)
+
+  await advancePlayback(env)
+  const snapshot = await channelSnapshot(env)
+  const response = json(snapshot, 200, 'public, max-age=8, s-maxage=8', {
+    ETag: channelEtag(snapshot.revision),
+  })
+  execution.waitUntil(cache.put(key, response.clone()).catch((error: unknown) => {
+    console.warn(JSON.stringify({
+      event: 'state_cache_write_failed',
+      error: error instanceof Error ? error.name : 'UnknownError',
+    }))
+  }))
+  return conditionalStateResponse(request, response)
+}
+
 async function handleD1QuotaApi(request: Request, env: WorkerEnv, until: number) {
   const pathname = new URL(request.url).pathname
   const method = request.method
@@ -1628,21 +1701,16 @@ async function handleApi(
     return json({ status: 'ok', database: 'ok', revision: Number(state?.revision ?? 0), provider: 'orange' })
   }
   if (method === 'GET' && pathname === '/api/state') {
-    await advancePlayback(env)
-    const snapshot = await channelSnapshot(env)
-    scheduleDispatch(execution, env)
-    return json(snapshot)
+    return stateResponse(request, env, execution)
   }
   if (method === 'GET' && pathname === '/status.json') {
     await advancePlayback(env)
     const snapshot = await channelSnapshot(env)
-    scheduleDispatch(execution, env)
     return json(compatibilityStatus(snapshot), 200, 'public, max-age=2')
   }
   if (method === 'GET' && pathname === '/api/events') {
     await advancePlayback(env)
     const payload = JSON.stringify(await channelSnapshot(env))
-    scheduleDispatch(execution, env)
     return new Response(`event: state\ndata: ${payload}\n\nretry: 2500\n\n`, {
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',

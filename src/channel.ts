@@ -84,13 +84,16 @@ async function readResponse<T>(response: Response): Promise<T> {
   )
 }
 
-async function getSnapshot(signal?: AbortSignal) {
+async function getSnapshot(revision: number, signal?: AbortSignal) {
+  const headers = new Headers({ Accept: 'application/json' })
+  if (revision >= 0) headers.set('If-None-Match', `"channel-${revision}"`)
   const response = await fetch('/api/state', {
-    headers: { Accept: 'application/json' },
+    headers,
     credentials: 'same-origin',
     cache: 'no-store',
     signal,
   })
+  if (response.status === 304) return null
   return readResponse<ChannelSnapshot>(response)
 }
 
@@ -150,7 +153,8 @@ export function useChannel() {
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
-      applySnapshot(await getSnapshot(signal))
+      const next = await getSnapshot(latestRevision.current, signal)
+      if (next) applySnapshot(next)
     } catch (requestError) {
       if (signal?.aborted) return
       setError(requestError instanceof Error ? requestError.message : 'Channel connection failed')
@@ -178,7 +182,7 @@ export function useChannel() {
     const poll = async () => {
       await refresh(controller.signal)
       if (stopped) return
-      timer = window.setTimeout(poll, document.hidden ? 15_000 : 4_000)
+      timer = window.setTimeout(poll, document.hidden ? 60_000 : 15_000)
     }
     const refreshForVisibility = () => {
       if (!document.hidden) void refresh(controller.signal)
