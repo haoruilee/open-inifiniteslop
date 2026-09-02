@@ -576,6 +576,7 @@ function App() {
   const requestPlaybackAdvance = useCallback(async () => {
     const playback = nowPlaying
     const startedAt = playback?.startedAt
+    if (playback?.generationProgress === 'd1_quota_readonly') return
     if (!playback || !nowPlayingKey || typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt)) return
     if (playbackAdvanceInFlight.current === nowPlayingKey) return
 

@@ -122,6 +122,11 @@ type PlaybackAdvanceRequest = {
   startedAt: number
 }
 
+type D1QuotaCircuit = {
+  until: number
+  detectedAt: number
+}
+
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
 const defaultArchiveLimit = 500
@@ -149,6 +154,8 @@ const generationRateLimitBackoffMs = 5 * 60_000
 const maximumGenerationPollsPerTick = 8
 const channelBotVisitorId = 'channel-bot'
 const channelBotAuthor = 'channel bot'
+const d1QuotaCircuitKey = 'system/d1-quota-circuit'
+const d1QuotaFallbackSlotMs = 30_000
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -353,14 +360,100 @@ function finalize(response: Response, context: RequestContext, noindex = false) 
   })
 }
 
-function json(body: unknown, status = 200, cacheControl = 'no-store') {
+function json(body: unknown, status = 200, cacheControl = 'no-store', extraHeaders?: HeadersInit) {
+  const headers = new Headers(extraHeaders)
+  headers.set('Content-Type', 'application/json; charset=utf-8')
+  headers.set('Cache-Control', cacheControl)
   return new Response(JSON.stringify(body), {
     status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': cacheControl,
-    },
+    headers,
   })
+}
+
+function configuredD1QuotaReadonlyUntil(env: WorkerEnv) {
+  const value = typeof env.D1_EMERGENCY_READONLY_UNTIL === 'string'
+    ? Date.parse(env.D1_EMERGENCY_READONLY_UNTIL)
+    : Number.NaN
+  return Number.isFinite(value) && value > Date.now() ? value : null
+}
+
+function nextUtcMidnight(now = Date.now()) {
+  const date = new Date(now)
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1)
+}
+
+function isD1QuotaError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return /\bd1\b.{0,100}(?:quota|limit|daily|row)/iu.test(message)
+    || /(?:rows?_written|rows? written|daily row (?:read|write))/iu.test(message)
+}
+
+async function d1QuotaCircuitUntil(env: WorkerEnv) {
+  const configured = configuredD1QuotaReadonlyUntil(env)
+  if (configured !== null) return configured
+  const stored = await env.VIDEO_MEDIA.get<D1QuotaCircuit>(d1QuotaCircuitKey, 'json').catch(() => null)
+  return stored && Number.isFinite(stored.until) && stored.until > Date.now() ? stored.until : null
+}
+
+async function recordD1QuotaCircuit(env: WorkerEnv) {
+  const now = Date.now()
+  const until = nextUtcMidnight(now)
+  await env.VIDEO_MEDIA.put(d1QuotaCircuitKey, JSON.stringify({ until, detectedAt: now } satisfies D1QuotaCircuit), {
+    expirationTtl: Math.max(60, Math.ceil((until - now) / 1_000) + 3_600),
+  }).catch(() => undefined)
+  return until
+}
+
+function quotaRetryAfter(until: number) {
+  return String(Math.max(1, Math.ceil((until - Date.now()) / 1_000)))
+}
+
+function fallbackChannelSnapshot(): ChannelSnapshot {
+  const now = Date.now()
+  const slot = Math.floor(now / d1QuotaFallbackSlotMs)
+  const startedAt = slot * d1QuotaFallbackSlotMs
+  const assetNumber = Math.abs(slot % 3) + 1
+  return {
+    // Keep this below every persisted revision so a recovered D1 snapshot wins
+    // immediately after the daily quota resets.
+    revision: -1,
+    live: {
+      isLive: true,
+      viewers: 1,
+      likes: 9_000,
+      provider: 'orange',
+    },
+    nowPlaying: {
+      id: -(slot + 1),
+      user: 'channel relay',
+      message: 'The archive relay is keeping the channel on air while live updates recover.',
+      status: 'playing',
+      votes: 0,
+      createdAt: startedAt,
+      time: formatClock(startedAt),
+      videoUrl: `/assets/mock-loop-${assetNumber}.mp4`,
+      posterUrl: '/assets/tv-frame.webp',
+      durationSeconds: 30,
+      generationProgress: 'd1_quota_readonly',
+      startedAt,
+    },
+    playingNext: [],
+    generatingNow: [],
+    queue: [],
+    chat: [],
+    chatPage: { hasMore: false, oldestId: null },
+    serverTime: now,
+  }
+}
+
+function d1QuotaReadonlyResponse(until: number) {
+  return json({
+    error: {
+      code: 'D1_QUOTA_READONLY',
+      message: 'The live archive is on air while the database daily quota resets.',
+    },
+    resetsAt: new Date(until).toISOString(),
+  }, 503, 'no-store', { 'Retry-After': quotaRetryAfter(until) })
 }
 
 function errorResponse(error: HttpError) {
@@ -812,6 +905,32 @@ async function handleSeo(request: Request, env: WorkerEnv) {
       : seoNotFound(request)
   }
   return null
+}
+
+async function handleD1QuotaSeo(request: Request, env: WorkerEnv, until: number) {
+  const pathname = new URL(request.url).pathname
+  if (!isSeoRoute(pathname)) return null
+  if (pathname === '/about' || pathname === '/about/') {
+    return seoResponse(
+      request,
+      renderAboutPage(),
+      'text/html; charset=utf-8',
+      200,
+      'public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400',
+    )
+  }
+  if (pathname === '/sitemap.xml') return env.ASSETS.fetch(request)
+
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Archive temporarily updating</title></head><body><main><h1>Archive temporarily updating</h1><p>The live channel remains on air while its archive database resets.</p><p>Please retry after ${new Date(until).toISOString()}.</p><p><a href="/">Watch live</a></p></main></body></html>`
+  return new Response(request.method === 'HEAD' ? null : body, {
+    status: 503,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Retry-After': quotaRetryAfter(until),
+      'X-Robots-Tag': 'noindex',
+    },
+  })
 }
 
 async function replayCandidates(env: WorkerEnv, limit: number) {
@@ -1432,6 +1551,52 @@ async function serveMedia(request: Request, env: WorkerEnv, ideaId: number) {
   return new Response(request.method === 'HEAD' ? null : bytes.slice(start, end + 1), { status, headers })
 }
 
+async function serveFallbackArchiveMedia(request: Request, env: WorkerEnv, seed: number) {
+  const assetNumber = Math.abs(seed % 3) + 1
+  const fallback = new URL(request.url)
+  fallback.pathname = `/assets/mock-loop-${assetNumber}.mp4`
+  fallback.search = ''
+  return env.ASSETS.fetch(new Request(fallback.toString(), {
+    method: request.method,
+    headers: request.headers,
+  }))
+}
+
+async function handleD1QuotaApi(request: Request, env: WorkerEnv, until: number) {
+  const pathname = new URL(request.url).pathname
+  const method = request.method
+  const mediaMatch = pathname.match(/^\/api\/media\/(\d+)$/u)
+  if ((method === 'GET' || method === 'HEAD') && mediaMatch) {
+    return serveFallbackArchiveMedia(request, env, Number(mediaMatch[1]))
+  }
+  if (method === 'GET' && pathname === '/api/state') return json(fallbackChannelSnapshot())
+  if (method === 'GET' && pathname === '/status.json') {
+    return json(compatibilityStatus(fallbackChannelSnapshot()), 200, 'public, max-age=10')
+  }
+  if (method === 'GET' && pathname === '/api/events') {
+    const payload = JSON.stringify(fallbackChannelSnapshot())
+    return new Response(`event: state\ndata: ${payload}\n\nretry: 15000\n\n`, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+      },
+    })
+  }
+  if (method === 'GET' && pathname === '/api/chat') {
+    return json({ items: [], page: { hasMore: false, nextBefore: null } }, 200, 'private, max-age=0')
+  }
+  if (method === 'GET' && pathname === '/api/health') {
+    return json({
+      status: 'degraded',
+      database: 'quota_readonly',
+      provider: 'orange',
+      resetsAt: new Date(until).toISOString(),
+    }, 503, 'no-store', { 'Retry-After': quotaRetryAfter(until) })
+  }
+  return d1QuotaReadonlyResponse(until)
+}
+
 function scheduleDispatch(execution: ExecutionContext, env: WorkerEnv) {
   execution.waitUntil(dispatchQueued(env).catch((error) => {
     console.error(JSON.stringify({
@@ -1441,7 +1606,14 @@ function scheduleDispatch(execution: ExecutionContext, env: WorkerEnv) {
   }))
 }
 
-async function handleApi(request: Request, env: WorkerEnv, context: RequestContext, execution: ExecutionContext) {
+async function handleApi(
+  request: Request,
+  env: WorkerEnv,
+  context: RequestContext,
+  execution: ExecutionContext,
+  d1QuotaUntil: number | null,
+) {
+  if (d1QuotaUntil !== null) return handleD1QuotaApi(request, env, d1QuotaUntil)
   const url = new URL(request.url)
   const pathname = url.pathname
   const method = request.method
@@ -1660,6 +1832,25 @@ function orangeHeaders(env: WorkerEnv, includeJson = false) {
   return headers
 }
 
+async function runScheduled(env: WorkerEnv) {
+  const quotaUntil = await d1QuotaCircuitUntil(env)
+  if (quotaUntil !== null) {
+    console.warn(JSON.stringify({ event: 'd1_quota_circuit_open', until: quotaUntil }))
+    return
+  }
+  try {
+    await reconcileStaleGenerations(env)
+    await pollGeneratingTasks(env)
+    await queueChannelBotPrompts(env)
+    await advancePlayback(env)
+    await dispatchQueued(env)
+  } catch (error) {
+    if (!isD1QuotaError(error)) throw error
+    const until = await recordD1QuotaCircuit(env)
+    console.warn(JSON.stringify({ event: 'd1_quota_circuit_opened', until }))
+  }
+}
+
 const worker: ExportedHandler<WorkerEnv> = {
   async fetch(request, env, execution) {
     const pathname = new URL(request.url).pathname
@@ -1668,13 +1859,26 @@ const worker: ExportedHandler<WorkerEnv> = {
     const context = requestContext(request, !statelessRequest)
     const noindex = isTechnicalNoindexPath(pathname)
     try {
-      const seo = isApi ? null : await handleSeo(request, env)
+      const d1QuotaUntil = await d1QuotaCircuitUntil(env)
+      const seo = isApi
+        ? null
+        : d1QuotaUntil === null
+          ? await handleSeo(request, env)
+          : await handleD1QuotaSeo(request, env, d1QuotaUntil)
       const response = isApi
-        ? await handleApi(request, env, context, execution)
+        ? await handleApi(request, env, context, execution, d1QuotaUntil)
         : seo ?? await env.ASSETS.fetch(request)
       return finalize(response, context, noindex)
     } catch (error) {
       if (error instanceof HttpError) return finalize(errorResponse(error), context, noindex)
+      if (isD1QuotaError(error)) {
+        const d1QuotaUntil = await recordD1QuotaCircuit(env)
+        const seo = isApi ? null : await handleD1QuotaSeo(request, env, d1QuotaUntil)
+        const response = isApi
+          ? await handleD1QuotaApi(request, env, d1QuotaUntil)
+          : seo ?? d1QuotaReadonlyResponse(d1QuotaUntil)
+        return finalize(response, context, noindex)
+      }
       console.error(JSON.stringify({
         event: 'request_failed',
         requestId: context.requestId,
@@ -1684,13 +1888,7 @@ const worker: ExportedHandler<WorkerEnv> = {
     }
   },
   async scheduled(_controller, env, execution) {
-    execution.waitUntil((async () => {
-      await reconcileStaleGenerations(env)
-      await pollGeneratingTasks(env)
-      await queueChannelBotPrompts(env)
-      await advancePlayback(env)
-      await dispatchQueued(env)
-    })())
+    execution.waitUntil(runScheduled(env))
   },
 }
 
