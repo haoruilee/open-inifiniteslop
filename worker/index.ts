@@ -158,6 +158,7 @@ const d1QuotaCircuitKey = 'system/d1-quota-circuit'
 const d1QuotaFallbackSlotMs = 30_000
 const channelBotSlotKey = 'system/channel-bot-slot'
 const stateCacheTtlMs = 8_000
+let fallbackMediaKeyCache: { expiresAt: number; keys: string[] } | null = null
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -427,7 +428,6 @@ function fallbackChannelSnapshot(): ChannelSnapshot {
   const now = Date.now()
   const slot = Math.floor(now / d1QuotaFallbackSlotMs)
   const startedAt = slot * d1QuotaFallbackSlotMs
-  const assetNumber = Math.abs(slot % 3) + 1
   return {
     // Keep this below every persisted revision so a recovered D1 snapshot wins
     // immediately after the daily quota resets.
@@ -446,7 +446,7 @@ function fallbackChannelSnapshot(): ChannelSnapshot {
       votes: 0,
       createdAt: startedAt,
       time: formatClock(startedAt),
-      videoUrl: `/assets/mock-loop-${assetNumber}.mp4`,
+      videoUrl: `/api/media/fallback?slot=${slot}`,
       posterUrl: '/assets/tv-frame.webp',
       durationSeconds: 30,
       generationProgress: 'd1_quota_readonly',
@@ -1531,12 +1531,8 @@ async function createSubmission(env: WorkerEnv, context: RequestContext, nicknam
   return { idea, revision: Number(revision?.revision ?? 0) }
 }
 
-async function serveMedia(request: Request, env: WorkerEnv, ideaId: number) {
-  const idea = await env.DB.prepare(`
-    SELECT video_key FROM ideas WHERE id = ? AND video_key IS NOT NULL
-  `).bind(ideaId).first<{ video_key: string }>()
-  if (!idea) throw new HttpError(404, 'NOT_FOUND', 'Video not found')
-  const stored = await env.VIDEO_MEDIA.getWithMetadata<{ contentType?: string }>(idea.video_key, 'arrayBuffer')
+async function serveStoredMedia(request: Request, env: WorkerEnv, videoKey: string) {
+  const stored = await env.VIDEO_MEDIA.getWithMetadata<{ contentType?: string }>(videoKey, 'arrayBuffer')
   if (!stored.value) throw new HttpError(404, 'NOT_FOUND', 'Video not found')
   const bytes = new Uint8Array(stored.value)
   let start = 0
@@ -1577,7 +1573,26 @@ async function serveMedia(request: Request, env: WorkerEnv, ideaId: number) {
   return new Response(request.method === 'HEAD' ? null : bytes.slice(start, end + 1), { status, headers })
 }
 
-async function serveFallbackArchiveMedia(request: Request, env: WorkerEnv, seed: number) {
+async function serveMedia(request: Request, env: WorkerEnv, ideaId: number) {
+  const idea = await env.DB.prepare(`
+    SELECT video_key FROM ideas WHERE id = ? AND video_key IS NOT NULL
+  `).bind(ideaId).first<{ video_key: string }>()
+  if (!idea) throw new HttpError(404, 'NOT_FOUND', 'Video not found')
+  return serveStoredMedia(request, env, idea.video_key)
+}
+
+async function fallbackMediaKeys(env: WorkerEnv) {
+  const now = Date.now()
+  if (fallbackMediaKeyCache && fallbackMediaKeyCache.expiresAt > now) return fallbackMediaKeyCache.keys
+  const listed = await env.VIDEO_MEDIA.list({ prefix: 'videos/', limit: 1_000 })
+  const keys = listed.keys
+    .map((entry) => entry.name)
+    .filter((key) => /^videos\/\d+\.mp4$/u.test(key))
+  fallbackMediaKeyCache = { keys, expiresAt: now + 5 * 60_000 }
+  return keys
+}
+
+async function serveBundledFallbackMedia(request: Request, env: WorkerEnv, seed: number) {
   const assetNumber = Math.abs(seed % 3) + 1
   const fallback = new URL(request.url)
   fallback.pathname = `/assets/mock-loop-${assetNumber}.mp4`
@@ -1586,6 +1601,30 @@ async function serveFallbackArchiveMedia(request: Request, env: WorkerEnv, seed:
     method: request.method,
     headers: request.headers,
   }))
+}
+
+function relayMediaResponse(response: Response, source: 'kv' | 'bundled') {
+  const headers = new Headers(response.headers)
+  headers.set('X-Archive-Relay', source)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+async function serveFallbackArchiveMedia(request: Request, env: WorkerEnv, seed: number) {
+  try {
+    const keys = await fallbackMediaKeys(env)
+    if (keys.length > 0) {
+      const key = keys[Math.abs(seed) % keys.length]
+      return relayMediaResponse(await serveStoredMedia(request, env, key), 'kv')
+    }
+  } catch {
+    // A static bundled clip is deliberately retained as the no-D1 fallback if
+    // KV is briefly unavailable or the archive key listing is incomplete.
+  }
+  return relayMediaResponse(await serveBundledFallbackMedia(request, env, seed), 'bundled')
 }
 
 function channelEtag(revision: number) {
@@ -1636,8 +1675,14 @@ async function stateResponse(request: Request, env: WorkerEnv, execution: Execut
 }
 
 async function handleD1QuotaApi(request: Request, env: WorkerEnv, until: number) {
-  const pathname = new URL(request.url).pathname
+  const url = new URL(request.url)
+  const pathname = url.pathname
   const method = request.method
+  if ((method === 'GET' || method === 'HEAD') && pathname === '/api/media/fallback') {
+    const rawSlot = url.searchParams.get('slot')
+    const slot = rawSlot && /^-?\d+$/u.test(rawSlot) ? Number(rawSlot) : Math.floor(Date.now() / d1QuotaFallbackSlotMs)
+    return serveFallbackArchiveMedia(request, env, Number.isSafeInteger(slot) ? slot : 0)
+  }
   const mediaMatch = pathname.match(/^\/api\/media\/(\d+)$/u)
   if ((method === 'GET' || method === 'HEAD') && mediaMatch) {
     return serveFallbackArchiveMedia(request, env, Number(mediaMatch[1]))
@@ -1691,6 +1736,11 @@ async function handleApi(
   const pathname = url.pathname
   const method = request.method
 
+  if ((method === 'GET' || method === 'HEAD') && pathname === '/api/media/fallback') {
+    const rawSlot = url.searchParams.get('slot')
+    const slot = rawSlot && /^-?\d+$/u.test(rawSlot) ? Number(rawSlot) : Math.floor(Date.now() / d1QuotaFallbackSlotMs)
+    return serveFallbackArchiveMedia(request, env, Number.isSafeInteger(slot) ? slot : 0)
+  }
   const mediaMatch = pathname.match(/^\/api\/media\/(\d+)$/u)
   if ((method === 'GET' || method === 'HEAD') && mediaMatch) {
     return serveMedia(request, env, Number(mediaMatch[1]))
