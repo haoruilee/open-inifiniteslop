@@ -1,6 +1,5 @@
 import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  advanceChannelPlayback,
   ChannelApiError,
   type ChannelIdea,
   likeChannel,
@@ -344,7 +343,7 @@ function noticeForError(error: unknown) {
 
 function App() {
   const isDesktop = useDeskQueue()
-  const { snapshot, error: connectionError, refresh, applyLikes, applySnapshot } = useChannel()
+  const { snapshot, error: connectionError, refresh, applyLikes } = useChannel()
   const [tunedIn, setTunedIn] = useState(false)
   const [tuneRequested, setTuneRequested] = useState(false)
   const [chatOpen, setChatOpen] = useState(true)
@@ -368,9 +367,6 @@ function App() {
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
   const chatHistoryExhausted = useRef(false)
-  const endedPlaybackKey = useRef<string | null>(null)
-  const playbackRetryTimers = useRef<number[]>([])
-  const playbackAdvanceInFlight = useRef<string | null>(null)
   const activeSlotRef = useRef<PlaybackSlot>('a')
   const slotPlaybackRef = useRef<Record<PlaybackSlot, ChannelIdea | null>>({ a: null, b: null })
   const [activeSlot, setActiveSlot] = useState<PlaybackSlot>('a')
@@ -409,23 +405,6 @@ function App() {
   useEffect(() => {
     setFailedVideoId(null)
   }, [nowPlaying?.id, nowPlaying?.videoUrl, nowPlaying?.startedAt])
-
-  const clearPlaybackRetries = useCallback(() => {
-    for (const timer of playbackRetryTimers.current) window.clearTimeout(timer)
-    playbackRetryTimers.current = []
-  }, [])
-
-  useEffect(() => () => clearPlaybackRetries(), [clearPlaybackRetries])
-
-  useEffect(() => {
-    if (endedPlaybackKey.current !== null && endedPlaybackKey.current !== nowPlayingKey) {
-      endedPlaybackKey.current = null
-      clearPlaybackRetries()
-    }
-    if (playbackAdvanceInFlight.current !== null && playbackAdvanceInFlight.current !== nowPlayingKey) {
-      playbackAdvanceInFlight.current = null
-    }
-  }, [clearPlaybackRetries, nowPlayingKey])
 
   useEffect(() => {
     if (failedVideoId === null) return
@@ -573,41 +552,6 @@ function App() {
     slot === 'a' ? videoARef.current : videoBRef.current
   ), [])
 
-  const requestPlaybackAdvance = useCallback(async () => {
-    const playback = nowPlaying
-    const startedAt = playback?.startedAt
-    if (playback?.generationProgress === 'd1_quota_readonly') return
-    if (!playback || !nowPlayingKey || typeof startedAt !== 'number' || !Number.isSafeInteger(startedAt)) return
-    if (playbackAdvanceInFlight.current === nowPlayingKey) return
-
-    playbackAdvanceInFlight.current = nowPlayingKey
-    try {
-      applySnapshot(await advanceChannelPlayback(playback.id, startedAt))
-    } catch {
-      void refresh()
-    } finally {
-      const requestKey = nowPlayingKey
-      window.setTimeout(() => {
-        if (playbackAdvanceInFlight.current === requestKey) playbackAdvanceInFlight.current = null
-      }, 1_500)
-    }
-  }, [applySnapshot, nowPlaying, nowPlayingKey, refresh])
-
-  const handleVideoEnded = useCallback(() => {
-    if (!nowPlayingKey || endedPlaybackKey.current === nowPlayingKey) return
-
-    endedPlaybackKey.current = nowPlayingKey
-    clearPlaybackRetries()
-    const requestNext = () => {
-      if (endedPlaybackKey.current === nowPlayingKey) void requestPlaybackAdvance()
-    }
-
-    requestNext()
-    for (const delay of [500, 1_200, 2_400, 4_000]) {
-      playbackRetryTimers.current.push(window.setTimeout(requestNext, delay))
-    }
-  }, [clearPlaybackRetries, nowPlayingKey, requestPlaybackAdvance])
-
   const playSlot = useCallback((slot: PlaybackSlot) => {
     const video = videoForSlot(slot)
     if (!video) return
@@ -618,11 +562,9 @@ function App() {
     void video.play().then(() => {
       if (video.isConnected && activeSlotRef.current === slot && tunedIn) video.muted = false
     }).catch(() => {
-      if (playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey) {
-        void requestPlaybackAdvance()
-      }
+      if (playbackIdentity(slotPlaybackRef.current[slot]) === nowPlayingKey) void refresh()
     })
-  }, [nowPlayingKey, requestPlaybackAdvance, tunedIn, videoForSlot])
+  }, [nowPlayingKey, refresh, tunedIn, videoForSlot])
 
   const promoteSlot = useCallback((slot: PlaybackSlot) => {
     const source = slotPlaybackRef.current[slot]
@@ -660,22 +602,8 @@ function App() {
     const source = slotPlaybackRef.current[slot]
     if (!source || playbackIdentity(source) !== nowPlayingKey) return
     setFailedVideoId(source.id)
-    void requestPlaybackAdvance()
-  }, [nowPlayingKey, requestPlaybackAdvance])
-
-  const handleVideoProgress = useCallback((slot: PlaybackSlot) => {
-    if (slot !== activeSlotRef.current) return
-    const source = slotPlaybackRef.current[slot]
-    const video = videoForSlot(slot)
-    if (
-      !source
-      || playbackIdentity(source) !== nowPlayingKey
-      || !video
-      || !Number.isFinite(video.duration)
-      || video.duration <= 0
-    ) return
-    if (video.currentTime >= video.duration - 0.35) handleVideoEnded()
-  }, [handleVideoEnded, nowPlayingKey, videoForSlot])
+    void refresh()
+  }, [nowPlayingKey, refresh])
 
   useEffect(() => {
     if (!showVideo || !nowPlaying || !nowPlayingKey) return
@@ -718,7 +646,7 @@ function App() {
       ))
       const video = targetSlot ? videoForSlot(targetSlot) : null
       if (!targetSlot || !video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        void requestPlaybackAdvance()
+        void refresh()
       } else if (targetSlot === activeSlotRef.current && video.paused) {
         playSlot(targetSlot)
       } else if (targetSlot !== activeSlotRef.current) {
@@ -727,7 +655,7 @@ function App() {
     }, 8_000)
 
     return () => window.clearTimeout(watchdog)
-  }, [nowPlayingKey, playSlot, promoteSlot, requestPlaybackAdvance, showVideo, slotPlayback, videoForSlot])
+  }, [nowPlayingKey, playSlot, promoteSlot, refresh, showVideo, slotPlayback, videoForSlot])
 
   return (
     <main className={`app ${isDesktop ? 'desktop-queue' : ''} ${chatOpen ? '' : 'chat-closed'}`}>
@@ -753,8 +681,6 @@ function App() {
             preload="auto"
             onCanPlay={() => handleCanPlay('a')}
             onError={() => handleVideoFailure('a')}
-            onTimeUpdate={() => handleVideoProgress('a')}
-            onEnded={handleVideoEnded}
           />
         ) : null}
         {slotBPlayback?.videoUrl ? (
@@ -769,8 +695,6 @@ function App() {
             preload="auto"
             onCanPlay={() => handleCanPlay('b')}
             onError={() => handleVideoFailure('b')}
-            onTimeUpdate={() => handleVideoProgress('b')}
-            onEnded={handleVideoEnded}
           />
         ) : null}
       </div>

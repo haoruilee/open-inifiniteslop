@@ -130,7 +130,6 @@ type D1QuotaCircuit = {
 const maximumVideoBytes = 25 * 1024 * 1024
 const defaultBufferTarget = 8
 const defaultArchiveLimit = 500
-const defaultPlaybackRecencyWindow = 48
 const defaultChatSnapshotLimit = 60
 const defaultChatPageLimit = 100
 const defaultDailyGenerationBudget = 100
@@ -157,7 +156,9 @@ const channelBotAuthor = 'channel bot'
 const d1QuotaCircuitKey = 'system/d1-quota-circuit'
 const d1QuotaFallbackSlotMs = 30_000
 const channelBotSlotKey = 'system/channel-bot-slot'
-const stateCacheTtlMs = 8_000
+// Playback is advanced exclusively by the once-per-minute scheduled handler.
+// A longer shared snapshot cache keeps viewer polling from turning into D1 work.
+const stateCacheTtlMs = 30_000
 let fallbackMediaKeyCache: { expiresAt: number; keys: string[] } | null = null
 const clockFormatter = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
@@ -188,10 +189,6 @@ function configuredBufferTarget(env: WorkerEnv) {
 
 function configuredArchiveLimit(env: WorkerEnv) {
   return boundedEnvNumber(env.VIDEO_ARCHIVE_LIMIT, defaultArchiveLimit, 8, 1_000)
-}
-
-function configuredPlaybackRecencyWindow(env: WorkerEnv) {
-  return boundedEnvNumber(env.PLAYBACK_RECENCY_WINDOW, defaultPlaybackRecencyWindow, 0, 240)
 }
 
 function configuredChatSnapshotLimit(env: WorkerEnv) {
@@ -962,51 +959,24 @@ async function handleD1QuotaSeo(request: Request, env: WorkerEnv, until: number)
 async function replayCandidates(env: WorkerEnv, limit: number) {
   if (limit <= 0) return [] as IdeaRow[]
 
-  const recencyWindow = configuredPlaybackRecencyWindow(env)
-  const standardCandidates = () => rows<IdeaRow>(env.DB.prepare(`
+  // A clip receives a fresh status_changed_at timestamp once it leaves the
+  // broadcast. The oldest aired records are therefore the least recently
+  // played, without a full-archive NOT IN scan on every snapshot.
+  return rows<IdeaRow>(env.DB.prepare(`
     SELECT * FROM ideas WHERE status = 'aired' AND video_key IS NOT NULL
-    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT ?
+    ORDER BY status_changed_at ASC, created_at ASC, id ASC LIMIT ?
   `).bind(limit))
-  if (recencyWindow === 0) return standardCandidates()
-
-  const nonRecent = await rows<IdeaRow>(env.DB.prepare(`
-    SELECT * FROM ideas
-    WHERE status = 'aired' AND video_key IS NOT NULL
-      AND id NOT IN (
-        SELECT id FROM ideas
-        WHERE status = 'aired' AND video_key IS NOT NULL
-        ORDER BY status_changed_at DESC, id DESC LIMIT ?
-      )
-    ORDER BY play_count ASC, status_changed_at ASC, id ASC LIMIT ?
-  `).bind(recencyWindow, limit))
-  if (nonRecent.length >= limit) return nonRecent
-
-  // Small archives cannot always satisfy the history window. Fill the preview
-  // deterministically while keeping every item distinct where possible.
-  const selected = [...nonRecent]
-  const selectedIds = new Set(selected.map((idea) => Number(idea.id)))
-  for (const candidate of await standardCandidates()) {
-    if (selectedIds.has(Number(candidate.id))) continue
-    selected.push(candidate)
-    selectedIds.add(Number(candidate.id))
-    if (selected.length === limit) break
-  }
-  return selected
 }
 
-async function advancePlayback(env: WorkerEnv, force?: PlaybackAdvanceRequest) {
+async function advancePlayback(env: WorkerEnv) {
   const now = Date.now()
   const current = await env.DB.prepare(`
     SELECT * FROM ideas WHERE status = 'playing'
     ORDER BY status_changed_at ASC, id ASC LIMIT 1
   `).first<IdeaRow>()
   const currentStartedAt = Number(current?.status_changed_at)
-  const forceMatchesCurrent = Boolean(
-    force && current && Number(current.id) === force.ideaId && currentStartedAt === force.startedAt,
-  )
   if (
     current
-    && !forceMatchesCurrent
     && now - currentStartedAt < Number(current.duration_seconds ?? 10) * 1_000
   ) {
     return
@@ -1660,9 +1630,8 @@ async function stateResponse(request: Request, env: WorkerEnv, execution: Execut
   const cached = await cache.match(key)
   if (cached) return conditionalStateResponse(request, cached)
 
-  await advancePlayback(env)
   const snapshot = await channelSnapshot(env)
-  const response = json(snapshot, 200, 'public, max-age=8, s-maxage=8', {
+  const response = json(snapshot, 200, 'public, max-age=30, s-maxage=30', {
     ETag: channelEtag(snapshot.revision),
   })
   execution.waitUntil(cache.put(key, response.clone()).catch((error: unknown) => {
@@ -1672,6 +1641,15 @@ async function stateResponse(request: Request, env: WorkerEnv, execution: Execut
     }))
   }))
   return conditionalStateResponse(request, response)
+}
+
+async function cachedChannelSnapshot(request: Request, env: WorkerEnv, execution: ExecutionContext) {
+  const cachedRequest = new Request(request.url, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  })
+  const response = await stateResponse(cachedRequest, env, execution)
+  return response.json() as Promise<ChannelSnapshot>
 }
 
 async function handleD1QuotaApi(request: Request, env: WorkerEnv, until: number) {
@@ -1754,14 +1732,12 @@ async function handleApi(
     return stateResponse(request, env, execution)
   }
   if (method === 'GET' && pathname === '/status.json') {
-    await advancePlayback(env)
-    const snapshot = await channelSnapshot(env)
-    return json(compatibilityStatus(snapshot), 200, 'public, max-age=2')
+    const snapshot = await cachedChannelSnapshot(request, env, execution)
+    return json(compatibilityStatus(snapshot), 200, 'public, max-age=30, s-maxage=30')
   }
   if (method === 'GET' && pathname === '/api/events') {
-    await advancePlayback(env)
-    const payload = JSON.stringify(await channelSnapshot(env))
-    return new Response(`event: state\ndata: ${payload}\n\nretry: 2500\n\n`, {
+    const payload = JSON.stringify(await cachedChannelSnapshot(request, env, execution))
+    return new Response(`event: state\ndata: ${payload}\n\nretry: 30000\n\n`, {
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-store',
@@ -1813,11 +1789,10 @@ async function handleApi(
     return json({ idea: toPublicIdea(result.idea), revision: result.revision }, 201)
   }
   if (method === 'POST' && pathname === '/api/playback/advance') {
-    await takeSubjectRateLimits(env, 'playback', context, 30, 180)
-    const requested = validatePlaybackAdvance(await readJson(request))
-    await advancePlayback(env, requested)
-    scheduleDispatch(execution, env)
-    return json(await channelSnapshot(env))
+    validatePlaybackAdvance(await readJson(request))
+    // Video completion is advisory. Scheduled rotation prevents every active
+    // viewer from becoming an independent D1 writer.
+    return stateResponse(request, env, execution)
   }
   const voteMatch = pathname.match(/^\/api\/queue\/(\d+)\/votes$/u)
   if (method === 'POST' && voteMatch) {
