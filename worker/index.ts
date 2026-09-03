@@ -335,7 +335,7 @@ function durationForIdea(env: WorkerEnv, idea: Pick<IdeaRow, 'id' | 'author' | '
 }
 
 function channelBotEnabled(env: WorkerEnv) {
-  return env.CHANNEL_BOT_ENABLED === 'true'
+  return (env.CHANNEL_BOT_ENABLED as string) === 'true'
 }
 
 function configuredChannelBotIntervalMs(env: WorkerEnv) {
