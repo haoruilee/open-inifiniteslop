@@ -2,6 +2,7 @@ import { moderatePrompt, normalizePrompt } from '../server/moderation.js'
 import { channelBotPromptFor } from './channel-bot-prompts.js'
 import { mp4DurationSeconds } from './mp4-duration.js'
 import { requiresOrangeGatewayAuth } from './orange-media.js'
+import { canonicalSeoRedirect } from './seo-routing.js'
 import {
   isSeoRoute,
   isTechnicalNoindexPath,
@@ -1946,6 +1947,8 @@ async function runScheduled(env: WorkerEnv) {
 
 const worker: ExportedHandler<WorkerEnv> = {
   async fetch(request, env, execution) {
+    const redirect = canonicalSeoRedirect(request)
+    if (redirect) return redirect
     const pathname = new URL(request.url).pathname
     const isApi = pathname.startsWith('/api/') || pathname === '/status.json'
     const statelessRequest = isSeoRoute(pathname) || pathname.startsWith('/api/media/')
